@@ -14,6 +14,16 @@ import subprocess
 import threading
 from io import StringIO
 
+# 尝试导入ttkbootstrap，如果没有安装则使用默认主题
+try:
+    import ttkbootstrap
+    from ttkbootstrap import Style
+    TTKBOOTSTRAP_AVAILABLE = True
+except ImportError:
+    TTKBOOTSTRAP_AVAILABLE = False
+    print("提示: 安装 ttkbootstrap 库可以获得更现代的界面主题")
+    print("安装命令: pip install ttkbootstrap")
+
 class ConfigUI:
     """主配置界面"""
     
@@ -34,6 +44,9 @@ class ConfigUI:
         
         # 初始化UI
         self.setup_ui()
+        
+        # 窗口关闭事件
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
     
     def setup_ui(self):
         """设置UI布局"""
@@ -47,7 +60,7 @@ class ConfigUI:
         
         # 创建配置面板容器
         config_frame = ttk.Frame(main_frame)
-        config_frame.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
+        config_frame.pack(fill=tk.BOTH, expand=True, side=tk.TOP, pady=(0, 10))
         
         # 创建选项卡控件
         notebook = ttk.Notebook(config_frame)
@@ -61,13 +74,17 @@ class ConfigUI:
         self.processing_panel = ProcessingConfigPanel(notebook, self.config)
         notebook.add(self.processing_panel, text="处理配置")
         
+        # 添加数据源配置面板
+        self.data_source_panel = DataSourceConfigPanel(notebook, self.config)
+        notebook.add(self.data_source_panel, text="数据源配置")
+        
         # 创建运行控制区
         run_frame = ttk.LabelFrame(main_frame, text="运行控制", padding="10")
         run_frame.pack(fill=tk.X, expand=False, side=tk.BOTTOM)
         
         # 按钮框架
         button_frame = ttk.Frame(run_frame)
-        button_frame.pack(fill=tk.X, side=tk.TOP)
+        button_frame.pack(fill=tk.X, side=tk.TOP, pady=(0, 5))
         
         # 运行按钮
         self.run_button = ttk.Button(button_frame, text="运行", command=self.run_program)
@@ -84,6 +101,11 @@ class ConfigUI:
         # 加载配置按钮
         load_button = ttk.Button(button_frame, text="加载配置", command=self.load_config_ui)
         load_button.pack(side=tk.LEFT, padx=5)
+        
+        # 主题切换按钮（如果ttkbootstrap可用）
+        if TTKBOOTSTRAP_AVAILABLE:
+            theme_button = ttk.Button(button_frame, text="切换主题", command=self.toggle_theme)
+            theme_button.pack(side=tk.RIGHT, padx=5)
         
         # 进度条
         progress_frame = ttk.Frame(run_frame, padding="5")
@@ -297,11 +319,10 @@ class ConfigUI:
                 self.process = None
                 
                 # 最终检查：确保显示正确的完成状态
-                if converted_tiffs < total_buffers:
-                    converted_tiffs = total_buffers
+                processed = total
                 progress = 100
                 self.progress_var.set(progress)
-                self.progress_label.config(text=f"{converted_tiffs}/{total_buffers}")
+                self.progress_label.config(text=f"{processed}/{total}")
                 self.root.update()
                 
                 # 恢复按钮状态
@@ -332,8 +353,28 @@ class ConfigUI:
                 messagebox.showerror("错误", f"停止程序失败: {e}")
         
         # 恢复按钮状态
-        self.root.children['!frame2'].children['!button'].config(state=tk.NORMAL)
+        self.run_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
+    
+    def on_closing(self):
+        """窗口关闭事件处理"""
+        if self.process:
+            if messagebox.askokcancel("退出", "程序正在运行，确定要退出吗？"):
+                self.stop_program()
+                self.root.destroy()
+        else:
+            self.root.destroy()
+    
+    def toggle_theme(self):
+        """切换主题"""
+        if TTKBOOTSTRAP_AVAILABLE:
+            themes = ['cosmo', 'flatly', 'journal', 'darkly', 'superhero', 'united']
+            current_theme = ttkbootstrap.Style().theme_use()
+            next_theme = themes[(themes.index(current_theme) + 1) % len(themes)]
+            ttkbootstrap.Style(theme=next_theme)
+            self.status_label.config(text=f"主题已切换为: {next_theme}")
+            self.log_text.insert(tk.END, f"\n=== 主题已切换为: {next_theme} ===\n")
+            self.log_text.see(tk.END)
 
 
 class PathConfigPanel(ttk.Frame):
@@ -584,9 +625,72 @@ class ProcessingConfigPanel(ttk.Frame):
         }
 
 
+class DataSourceConfigPanel(ttk.Frame):
+    """数据源配置面板"""
+    
+    def __init__(self, parent, config):
+        super().__init__(parent, padding="10")
+        self.config = config
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """设置数据源配置UI"""
+        # 创建数据源配置标签框
+        data_source_frame = ttk.LabelFrame(self, text="卫星数据源配置", padding="10")
+        data_source_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 数据源选择
+        ttk.Label(data_source_frame, text="默认数据源:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.default_data_source_var = tk.StringVar()
+        data_sources = ['ESRI World Imagery', 'Google Earth', 'Bing Maps', 'OpenStreetMap']
+        data_source_combo = ttk.Combobox(data_source_frame, textvariable=self.default_data_source_var, values=data_sources, width=30)
+        data_source_combo.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        
+        # 自定义WMS/WMTS服务
+        ttk.Label(data_source_frame, text="自定义WMS/WMTS服务:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.custom_service_var = tk.StringVar()
+        ttk.Entry(data_source_frame, textvariable=self.custom_service_var, width=60).grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(data_source_frame, text="(URL模板，使用{z}/{y}/{x}占位符)").grid(row=1, column=2, sticky=tk.W, pady=5)
+        
+        # 启用历史影像
+        ttk.Label(data_source_frame, text="历史影像服务:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.wayback_enabled_var = tk.BooleanVar()
+        ttk.Checkbutton(data_source_frame, text="启用ESRI Wayback历史影像服务", variable=self.wayback_enabled_var).grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
+        
+        # 设置初始值
+        self.set_config(self.config)
+    
+    def set_config(self, config):
+        """设置配置"""
+        # 设置默认数据源
+        satellite_services = config.get('satellite_services', [])
+        if satellite_services:
+            self.default_data_source_var.set(satellite_services[0].get('name', 'ESRI World Imagery'))
+        else:
+            self.default_data_source_var.set('ESRI World Imagery')
+        
+        # 设置历史影像服务
+        wayback_services = config.get('wayback_services', {})
+        self.wayback_enabled_var.set(wayback_services.get('enabled', False))
+    
+    def get_config(self):
+        """获取配置"""
+        return {
+            'default_data_source': self.default_data_source_var.get(),
+            'custom_service': self.custom_service_var.get(),
+            'wayback_enabled': self.wayback_enabled_var.get()
+        }
+
+
 def main():
     """主函数"""
-    root = tk.Tk()
+    # 使用现代主题
+    if TTKBOOTSTRAP_AVAILABLE:
+        style = Style(theme='cosmo')
+        root = style.master
+    else:
+        root = tk.Tk()
+    
     app = ConfigUI(root)
     root.mainloop()
 

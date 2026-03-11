@@ -38,9 +38,14 @@ class SatelliteToTiffConverter:
         
         # 会话池配置
         self.session = requests.Session()
+        
+        # 动态线程池大小
+        self.thread_pool_size = self.get_optimal_thread_pool_size()
+        print(f"使用动态线程池大小: {self.thread_pool_size}")
+        
         self.session.mount('https://', requests.adapters.HTTPAdapter(
-            pool_connections=THREAD_POOL_SIZE,
-            pool_maxsize=THREAD_POOL_SIZE * 2,
+            pool_connections=self.thread_pool_size,
+            pool_maxsize=self.thread_pool_size * 2,
             max_retries=RETRY_COUNT,
             pool_block=False
         ))
@@ -50,10 +55,74 @@ class SatelliteToTiffConverter:
         
         # 缓存Wayback日期列表
         self._wayback_dates = None
+        
+        # OpenStreetMap子域名
+        self.osm_subdomains = ['a', 'b', 'c']
+        
+        # 任务优先级队列
+        self.priority_queue = []
     
     def get_random_user_agent(self) -> str:
         """获取随机User-Agent"""
         return random.choice(USER_AGENTS)
+    
+    def tile_to_quadkey(self, x: int, y: int, zoom: int) -> str:
+        """将瓦片坐标转换为Bing Maps quadkey"""
+        quadkey = []
+        for i in range(zoom, 0, -1):
+            digit = 0
+            mask = 1 << (i - 1)
+            if (x & mask) != 0:
+                digit += 1
+            if (y & mask) != 0:
+                digit += 2
+            quadkey.append(str(digit))
+        return ''.join(quadkey)
+    
+    def get_service_by_name(self, name: str) -> Optional[Dict]:
+        """根据服务名称获取服务配置"""
+        for service in self.services:
+            if service.get('name') == name:
+                return service
+        return None
+    
+    def get_optimal_thread_pool_size(self) -> int:
+        """根据系统资源动态计算最优线程池大小"""
+        import os
+        import psutil
+        
+        try:
+            # 获取CPU核心数
+            cpu_count = os.cpu_count() or 4
+            
+            # 获取可用内存（MB）
+            available_memory = psutil.virtual_memory().available / (1024 * 1024)
+            
+            # 基础线程数 = CPU核心数 * 1.5
+            base_threads = int(cpu_count * 1.5)
+            
+            # 根据内存调整
+            # 假设每个线程需要约100MB内存
+            memory_based_threads = int(available_memory / 100)
+            
+            # 取两者的最小值
+            optimal_threads = min(base_threads, memory_based_threads)
+            
+            # 确保线程数在合理范围内
+            optimal_threads = max(4, min(optimal_threads, 100))
+            
+            # 从配置中获取线程池大小，如果配置了则使用配置值
+            config_threads = PROCESSING.get('thread_pool_size')
+            if config_threads:
+                optimal_threads = min(config_threads, optimal_threads)
+            
+            return optimal_threads
+        except ImportError:
+            # 如果没有psutil库，使用默认值
+            return min(THREAD_POOL_SIZE, 50)
+        except Exception:
+            # 出错时使用默认值
+            return min(THREAD_POOL_SIZE, 50)
     
     def get_wayback_dates(self) -> List[Dict]:
         """获取ESRI World Imagery Wayback可用的历史影像日期列表
@@ -394,7 +463,8 @@ class SatelliteToTiffConverter:
                 tasks.append((final_backup_url, tile_path, headers))
 
         print(f"开始下载 {total_tiles} 个瓦片...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE) as executor:
+        # 使用动态线程池大小
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_pool_size) as executor:
             future_to_tile = {
                 executor.submit(self.download_tile_worker_with_url, url, path, hdr): (x, y)
                 for (x, y), (url, path, hdr) in zip(tile_coords, tasks)
@@ -555,7 +625,20 @@ class SatelliteToTiffConverter:
     
     def download_tile_worker(self, service: Dict, x: int, y: int, zoom: int, save_path: str) -> bool:
         """下载单个瓦片"""
-        url = service['url_template'].format(z=zoom, x=x, y=y)
+        url_template = service['url_template']
+        
+        # 根据服务类型处理不同的URL模板
+        if '{quadkey}' in url_template:
+            # Bing Maps格式，需要quadkey
+            quadkey = self.tile_to_quadkey(x, y, zoom)
+            url = url_template.format(quadkey=quadkey)
+        elif '{s}' in url_template:
+            # OpenStreetMap格式，需要随机子域名
+            subdomain = random.choice(self.osm_subdomains)
+            url = url_template.format(s=subdomain, z=zoom, x=x, y=y)
+        else:
+            # 标准格式
+            url = url_template.format(z=zoom, x=x, y=y)
         
         headers = service.get('headers', {}).copy()
         headers['User-Agent'] = self.get_random_user_agent()
@@ -602,7 +685,8 @@ class SatelliteToTiffConverter:
             tile_path = os.path.join(temp_dir, f"tile_{x}_{y}_{zoom}.png")
             tasks.append((x, y, tile_path))
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE) as executor:
+        # 使用动态线程池大小
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_pool_size) as executor:
             future_to_tile = {
                 executor.submit(self.download_tile_worker, service, x, y, zoom, path): (x, y)
                 for x, y, path in tasks
@@ -749,7 +833,7 @@ class SatelliteToTiffConverter:
     
     def download_satellite_image(self, center_lat: float, center_lon: float, zoom: int,
                                 save_path: Optional[str] = None, tile_count: int = 3, kml_bounds: Optional[Dict] = None,
-                                image_type: str = 'current', image_date_info: Optional[Dict] = None) -> bool:
+                                image_type: str = 'current', image_date_info: Optional[Dict] = None, service_name: str = None) -> bool:
         """下载卫星影像
 
         参数:
@@ -761,10 +845,18 @@ class SatelliteToTiffConverter:
             kml_bounds: KML边界
             image_type: 影像类型，'current'表示当前影像，'previous'表示前一个时刻的影像
             image_date_info: 影像日期信息，包含id和url_template
+            service_name: 服务名称，None表示使用默认服务
         """
         try:
-            # 使用ESRI World Imagery服务
-            service = self.services[0]
+            # 选择服务
+            if service_name:
+                service = self.get_service_by_name(service_name)
+                if not service:
+                    print(f"警告: 未找到服务 '{service_name}'，使用默认服务")
+                    service = self.services[0]
+            else:
+                # 使用默认服务
+                service = self.services[0]
 
             # 检查缩放级别
             max_zoom = service['max_zoom']
@@ -935,7 +1027,7 @@ class SatelliteToTiffConverter:
             return False
     
     def process_kml_to_tiff(self, kml_file_path: str, output_dir: Optional[str] = None,
-                             download_mode: str = 'current') -> bool:
+                             download_mode: str = 'current', service_name: str = None) -> bool:
         """处理KML文件生成TIFF图像
 
         参数:
@@ -943,6 +1035,7 @@ class SatelliteToTiffConverter:
             output_dir: 输出目录
             download_mode: 下载模式，'current'表示仅当前影像，'previous'表示仅前一个时刻影像，
                           'both'表示同时下载当前和前一个时刻影像进行对比
+            service_name: 服务名称，None表示使用默认服务
         """
         if not os.path.exists(kml_file_path):
             print(f"KML文件不存在: {kml_file_path}")
@@ -1030,7 +1123,8 @@ class SatelliteToTiffConverter:
                 if self.download_satellite_image(
                     buffer_info['center_lat'], buffer_info['center_lon'],
                     zoom, png_path, tile_count=3, kml_bounds=buffer_info,
-                    image_type='current', image_date_info=current_date
+                    image_type='current', image_date_info=current_date,
+                    service_name=service_name
                 ):
                     if self.png_to_geotiff(png_path, tiff_path, buffer_info):
                         success_count += 1
@@ -1057,7 +1151,8 @@ class SatelliteToTiffConverter:
                 if self.download_satellite_image(
                     buffer_info['center_lat'], buffer_info['center_lon'],
                     zoom, png_path, tile_count=3, kml_bounds=buffer_info,
-                    image_type='previous', image_date_info=previous_date
+                    image_type='previous', image_date_info=previous_date,
+                    service_name=service_name
                 ):
                     if self.png_to_geotiff(png_path, tiff_path, buffer_info):
                         previous_success_count += 1
