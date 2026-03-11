@@ -124,19 +124,71 @@ class SatelliteToTiffConverter:
             # 出错时使用默认值
             return min(THREAD_POOL_SIZE, 50)
     
-    def get_wayback_dates(self) -> List[Dict]:
-        """获取ESRI World Imagery Wayback可用的历史影像日期列表
-
-        使用ESRI官方的World Imagery Wayback服务API，获取可用的历史影像时间点，
-        不使用任何硬编码的时间点。
+    def _build_current_date_dict(self, service_config: Optional[Dict] = None) -> Dict:
+        """构建当前影像日期字典
+        
+        Args:
+            service_config: 服务配置，如果为None则使用默认配置
+        
+        Returns:
+            当前影像日期字典
         """
-        if self._wayback_dates is not None:
-            return self._wayback_dates
-
-        if not self.wayback_enabled:
-            print("错误: Wayback服务未启用，请在配置文件中启用")
-            return []
-
+        current_time = datetime.now()
+        
+        # 使用配置或默认值
+        if service_config:
+            name = service_config.get('name', 'ESRI World Imagery (Current)')
+            description = service_config.get('description', '最新的全球卫星影像')
+            url_template = service_config.get('url_template', 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}')
+        else:
+            name = 'ESRI World Imagery (Current)'
+            description = '最新的全球卫星影像'
+            url_template = 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+        
+        return {
+            'id': 1,
+            'timestamp': int(current_time.timestamp() * 1000),
+            'date': current_time.strftime('%Y-%m-%d'),
+            'name': name,
+            'description': description,
+            'url_template': url_template
+        }
+    
+    def _build_historical_date_dict(self, year: int, service_config: Optional[Dict] = None) -> Dict:
+        """构建指定年份的历史影像日期字典
+        
+        Args:
+            year: 历史年份
+            service_config: 服务配置，如果为None则使用默认配置
+        
+        Returns:
+            历史影像日期字典
+        """
+        history_time = datetime.now().replace(year=year)
+        history_timestamp = int(history_time.timestamp() * 1000)
+        
+        # 使用配置或默认值
+        if service_config:
+            url_template = service_config.get('url_template', 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}')
+        else:
+            url_template = 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}'
+        
+        return {
+            'id': year - datetime.now().year + 100,  # 使用年份差作为ID基础
+            'timestamp': history_timestamp,
+            'date': history_time.strftime('%Y-%m-%d'),
+            'name': f"ESRI World Imagery ({year})",
+            'description': f"{year}年的历史全球影像服务",
+            'url_template': url_template,
+            'time': history_timestamp
+        }
+    
+    def _fetch_wayback_api_data(self) -> Optional[Dict]:
+        """获取Wayback API数据
+        
+        Returns:
+            API返回的JSON数据，如果请求失败则返回None
+        """
         try:
             # 从配置中读取API信息
             api_config = self.wayback_config.get('api', {})
@@ -158,100 +210,97 @@ class SatelliteToTiffConverter:
             response = self.session.get(time_api_url, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
             
-            data = response.json()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"错误: ESRI World Imagery Wayback服务请求失败 - {e}")
+            print("提示: 请检查网络连接和服务URL配置")
+            return None
+    
+    def _log_time_info(self, data: Dict) -> None:
+        """记录时间维度信息
+        
+        Args:
+            data: API返回的JSON数据
+        """
+        if 'timeInfo' in data:
+            time_info = data['timeInfo']
+            print(f"服务包含时间维度信息: {time_info.get('name', 'Unknown')}")
             
-            # 初始化日期列表
+            if 'timeExtent' in time_info:
+                time_extent = time_info['timeExtent']
+                print(f"时间范围: {time_extent}")
+            
+            if 'timeInterval' in time_info:
+                time_interval = time_info['timeInterval']
+                print(f"时间间隔: {time_interval}")
+        else:
+            print("警告: 服务未返回时间维度信息，使用默认时间点")
+    
+    def _build_fallback_dates(self, count: int = 1) -> List[Dict]:
+        """构建降级日期列表
+        
+        Args:
+            count: 需要返回的日期数量，默认为1（仅当前影像）
+        
+        Returns:
+            降级日期列表
+        """
+        dates = []
+        
+        # 添加当前影像
+        dates.append(self._build_current_date_dict())
+        
+        # 如果需要多个日期，添加历史影像
+        if count > 1:
+            for i in range(1, min(count, 6)):  # 最多添加5个历史影像
+                dates.append(self._build_historical_date_dict(datetime.now().year - i))
+        
+        return dates
+    
+    def get_wayback_dates(self) -> List[Dict]:
+        """获取ESRI World Imagery Wayback可用的历史影像日期列表
+
+        使用ESRI官方的World Imagery Wayback服务API，获取可用的历史影像时间点，
+        不使用任何硬编码的时间点。
+        """
+        if self._wayback_dates is not None:
+            return self._wayback_dates
+
+        if not self.wayback_enabled:
+            print("错误: Wayback服务未启用，请在配置文件中启用")
+            return []
+
+        try:
+            # 获取API数据
+            data = self._fetch_wayback_api_data()
+            if data is None:
+                return self._build_fallback_dates(count=2)
+
+            # 记录时间维度信息
+            self._log_time_info(data)
+
+            # 构建日期列表
             dates = []
-            
-            # 检查服务是否包含时间维度信息
-            if 'timeInfo' in data:
-                time_info = data['timeInfo']
-                print(f"服务包含时间维度信息: {time_info.get('name', 'Unknown')}")
-                
-                # 提取时间维度信息
-                if 'timeExtent' in time_info:
-                    time_extent = time_info['timeExtent']
-                    print(f"时间范围: {time_extent}")
-                
-                if 'timeInterval' in time_info:
-                    time_interval = time_info['timeInterval']
-                    print(f"时间间隔: {time_interval}")
-            else:
-                print("警告: 服务未返回时间维度信息，使用默认时间点")
-            
-            # 从配置中读取服务信息
             services_config = self.wayback_config.get('services', {})
-            
+
             # 处理当前影像服务
             current_service = services_config.get('current', {})
             if current_service:
-                current_time = datetime.now()
-                current_date = {
-                    'id': 1,
-                    'timestamp': int(current_time.timestamp() * 1000),
-                    'date': current_time.strftime('%Y-%m-%d'),
-                    'name': current_service.get('name', 'ESRI World Imagery (Current)'),
-                    'description': current_service.get('description', '最新的全球卫星影像'),
-                    'url_template': current_service.get('url_template', 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}')
-                }
-                dates.append(current_date)
+                dates.append(self._build_current_date_dict(current_service))
             else:
                 print("警告: 未配置当前影像服务，使用默认配置")
-                # 添加默认当前影像服务
-                current_time = datetime.now()
-                current_date = {
-                    'id': 1,
-                    'timestamp': int(current_time.timestamp() * 1000),
-                    'date': current_time.strftime('%Y-%m-%d'),
-                    'name': 'ESRI World Imagery (Current)',
-                    'description': '最新的全球卫星影像',
-                    'url_template': 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-                }
-                dates.append(current_date)
-            
+                dates.append(self._build_current_date_dict())
+
             # 处理历史影像服务
             historical_service = services_config.get('historical', {})
             if historical_service:
-                # 获取当前时间作为参考
-                current_time = datetime.now()
-                
-                # 生成最近5年的历史影像时间点
                 for i in range(1, 6):
-                    # 计算历史时间点（每年一个）
-                    history_time = current_time.replace(year=current_time.year - i)
-                    history_timestamp = int(history_time.timestamp() * 1000)
-                    
-                    # 构建Wayback服务的URL模板，包含时间参数
-                    wayback_url_template = historical_service.get('url_template', 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}')
-                    
-                    historical_date = {
-                        'id': i + 1,
-                        'timestamp': history_timestamp,
-                        'date': history_time.strftime('%Y-%m-%d'),
-                        'name': f"ESRI World Imagery ({history_time.year})",
-                        'description': f"{history_time.year}年的历史全球影像服务",
-                        'url_template': wayback_url_template,
-                        'time': history_timestamp
-                    }
-                    dates.append(historical_date)
+                    dates.append(self._build_historical_date_dict(datetime.now().year - i, historical_service))
             else:
                 print("警告: 未配置历史影像服务，使用默认配置")
-                # 添加默认历史影像服务
-                current_time = datetime.now()
                 for i in range(1, 6):
-                    history_time = current_time.replace(year=current_time.year - i)
-                    history_timestamp = int(history_time.timestamp() * 1000)
-                    historical_date = {
-                        'id': i + 1,
-                        'timestamp': history_timestamp,
-                        'date': history_time.strftime('%Y-%m-%d'),
-                        'name': f"ESRI World Imagery ({history_time.year})",
-                        'description': f"{history_time.year}年的历史全球影像服务",
-                        'url_template': 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}',
-                        'time': history_timestamp
-                    }
-                    dates.append(historical_date)
-            
+                    dates.append(self._build_historical_date_dict(datetime.now().year - i))
+
             # 按时间戳排序（最新的在前）
             dates.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
 
@@ -259,47 +308,16 @@ class SatelliteToTiffConverter:
             print(f"成功获取 {len(dates)} 个影像服务版本")
             for date_info in dates:
                 print(f"  - {date_info['name']}: {date_info['date']} - {date_info['description']}")
-            
+
             return dates
 
         except requests.exceptions.RequestException as e:
             print(f"错误: ESRI World Imagery Wayback服务请求失败 - {e}")
             print("提示: 请检查网络连接和服务URL配置")
-            # 出错时返回默认服务配置
-            fallback_dates = [
-                {
-                    'id': 1,
-                    'timestamp': int(datetime.now().timestamp() * 1000),
-                    'date': datetime.now().strftime('%Y-%m-%d'),
-                    'name': 'ESRI World Imagery (Current)',
-                    'description': '最新的全球卫星影像',
-                    'url_template': 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-                },
-                {
-                    'id': 2,
-                    'timestamp': int(datetime.now().replace(year=datetime.now().year-1).timestamp() * 1000),
-                    'date': datetime.now().replace(year=datetime.now().year-1).strftime('%Y-%m-%d'),
-                    'name': f"ESRI World Imagery ({datetime.now().year-1})",
-                    'description': f"{datetime.now().year-1}年的历史全球影像服务",
-                    'url_template': 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={{time}}',
-                    'time': int(datetime.now().replace(year=datetime.now().year-1).timestamp() * 1000)
-                }
-            ]
-            return fallback_dates
+            return self._build_fallback_dates(count=2)
         except Exception as e:
             print(f"错误: 获取Wayback日期列表时发生未知错误 - {e}")
-            # 出错时返回最小默认服务配置
-            minimal_fallback_dates = [
-                {
-                    'id': 1,
-                    'timestamp': int(datetime.now().timestamp() * 1000),
-                    'date': datetime.now().strftime('%Y-%m-%d'),
-                    'name': 'ESRI World Imagery (Current)',
-                    'description': '最新的全球卫星影像',
-                    'url_template': 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-                }
-            ]
-            return minimal_fallback_dates
+            return self._build_fallback_dates(count=1)
     
     def get_current_and_previous_dates(self) -> Tuple[Optional[Dict], Optional[Dict]]:
         """获取当前影像和前一个时刻的影像日期信息"""
