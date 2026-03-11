@@ -1,0 +1,16 @@
+name: satellite-image-processing
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - gdal
+  - pip
+  - pip:
+    - requests
+    - pillow
+    - numpy
+    - rasterio
+    - pyyaml
+    - psutil
+    - ttkbootstrap
