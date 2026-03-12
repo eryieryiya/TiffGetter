@@ -398,7 +398,8 @@ class SatelliteToTiffConverter:
                 return False
     
     def download_historical_tiles_batch(self, tile_coords: List[Tuple[int, int]], zoom: int,
-                                        temp_dir: str, image_date_info: Optional[Dict] = None) -> int:
+                                        temp_dir: str, image_date_info: Optional[Dict] = None, 
+                                        data_source_name: Optional[str] = None) -> int:
         """批量下载历史影像瓦片
 
         参数:
@@ -406,6 +407,7 @@ class SatelliteToTiffConverter:
             zoom: 缩放级别
             temp_dir: 临时目录
             image_date_info: 影像日期信息，包含id和url_template
+            data_source_name: 数据源名称，如不指定则使用第一个服务
         """
         self.downloaded_count = 0
         total_tiles = len(tile_coords)
@@ -423,9 +425,15 @@ class SatelliteToTiffConverter:
             print(f"时间参数: {time_param}")
         else:
             # 使用标准服务（当前最新影像）
-            service = self.services[0]
+            if data_source_name:
+                service = self.get_service_by_name(data_source_name)
+                if not service:
+                    print(f"警告: 未找到数据源 '{data_source_name}'，使用默认数据源")
+                    service = self.services[0]
+            else:
+                service = self.services[0]
             url_template = service['url_template']
-            print("下载当前最新影像")
+            print(f"下载当前最新影像 (数据源: {service['name']})")
             print(f"使用URL模板: {url_template}")
 
         # 使用正确的headers配置
@@ -441,7 +449,13 @@ class SatelliteToTiffConverter:
                 headers['Referer'] = 'https://www.arcgis.com/'
         else:
             # 从标准服务中获取headers
-            headers = self.services[0].get('headers', {}).copy()
+            if data_source_name:
+                service = self.get_service_by_name(data_source_name)
+                if not service:
+                    service = self.services[0]
+            else:
+                service = self.services[0]
+            headers = service.get('headers', {}).copy()
             if 'User-Agent' not in headers:
                 headers['User-Agent'] = self.get_random_user_agent()
 
@@ -458,7 +472,18 @@ class SatelliteToTiffConverter:
                     # 确保使用正确的ESRI World Imagery Wayback服务URL格式
                     url = url_template.format(z=zoom, x=x, y=y, time=image_date_info.get('time', ''))
                 else:
-                    url = url_template.format(z=zoom, x=x, y=y)
+                    # 处理不同数据源的URL模板
+                    if '{s}' in url_template:
+                        # OpenStreetMap需要随机子域名
+                        subdomain = random.choice(self.osm_subdomains)
+                        url = url_template.format(z=zoom, x=x, y=y, s=subdomain)
+                    elif '{q}' in url_template:
+                        # Bing Maps需要quadkey
+                        quadkey = self.tile_to_quadkey(x, y, zoom)
+                        url = url_template.format(q=quadkey, z=zoom, x=x, y=y)
+                    else:
+                        # 标准格式
+                        url = url_template.format(z=zoom, x=x, y=y)
                 print(f"  下载瓦片: {url}")
                 tasks.append((url, tile_path, headers))
             except KeyError as e:
@@ -650,6 +675,10 @@ class SatelliteToTiffConverter:
             # Bing Maps格式，需要quadkey
             quadkey = self.tile_to_quadkey(x, y, zoom)
             url = url_template.format(quadkey=quadkey)
+        elif '{q}' in url_template:
+            # Bing Maps格式，需要quadkey
+            quadkey = self.tile_to_quadkey(x, y, zoom)
+            url = url_template.format(q=quadkey, z=zoom, x=x, y=y)
         elif '{s}' in url_template:
             # OpenStreetMap格式，需要随机子域名
             subdomain = random.choice(self.osm_subdomains)
@@ -926,10 +955,10 @@ class SatelliteToTiffConverter:
             if is_historical and image_date_info:
                 date_str = image_date_info.get('date', 'unknown')
                 name = image_date_info.get('name', 'Historical Imagery')
-                print(f"下载 ESRI World Imagery 历史影像（日期: {date_str}, 名称: {name}）: 中心({center_lat:.6f}, {center_lon:.6f}), "
+                print(f"下载历史影像（日期: {date_str}, 名称: {name}）: 中心({center_lat:.6f}, {center_lon:.6f}), "
                       f"缩放级别{zoom}, {tile_count_x}x{tile_count_y}瓦片")
             else:
-                print(f"下载 ESRI World Imagery 当前影像: 中心({center_lat:.6f}, {center_lon:.6f}), "
+                print(f"下载 {service['name']} 当前影像: 中心({center_lat:.6f}, {center_lon:.6f}), "
                       f"缩放级别{zoom}, {tile_count_x}x{tile_count_y}瓦片")
 
             # 创建临时目录
@@ -944,7 +973,7 @@ class SatelliteToTiffConverter:
             # 批量下载瓦片
             if is_historical and self.wayback_enabled and image_date_info:
                 print("开始下载历史影像瓦片...")
-                tiles_downloaded = self.download_historical_tiles_batch(tile_coords, zoom, temp_dir, image_date_info)
+                tiles_downloaded = self.download_historical_tiles_batch(tile_coords, zoom, temp_dir, image_date_info, service_name)
             else:
                 print("开始下载当前影像瓦片...")
                 tiles_downloaded = self.download_tiles_batch(service, tile_coords, zoom, temp_dir)
@@ -962,23 +991,31 @@ class SatelliteToTiffConverter:
 
             # 拼接瓦片
             if tiles_downloaded > 0 and save_path:
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                print(f"开始拼接瓦片，保存到: {save_path}")
+                try:
+                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    print(f"开始拼接瓦片，保存到: {save_path}")
 
-                if self.stitch_tiles(temp_dir, max(tile_count_x, tile_count_y), save_path, kml_bounds):
-                    print(f"影像已成功保存到: {save_path}")
+                    if self.stitch_tiles(temp_dir, max(tile_count_x, tile_count_y), save_path, kml_bounds):
+                        print(f"影像已成功保存到: {save_path}")
 
-                    # 清理临时目录
-                    shutil.rmtree(temp_dir)
-                    print("临时目录已清理")
-                    return True
-                else:
-                    print("错误: 瓦片拼接失败")
-                    print("提示: 请检查临时目录权限和磁盘空间")
+                        # 清理临时目录
+                        shutil.rmtree(temp_dir)
+                        print("临时目录已清理")
+                        return True
+                    else:
+                        print("错误: 瓦片拼接失败")
+                        print("提示: 请检查临时目录权限和磁盘空间")
+                except Exception as e:
+                    print(f"错误: 拼接瓦片时发生异常 - {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # 清理临时目录
-            shutil.rmtree(temp_dir)
-            print("临时目录已清理")
+            try:
+                shutil.rmtree(temp_dir)
+                print("临时目录已清理")
+            except Exception as e:
+                print(f"错误: 清理临时目录时发生异常 - {e}")
             return False
         except Exception as e:
             print(f"错误: 下载卫星影像时发生异常 - {e}")

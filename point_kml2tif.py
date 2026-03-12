@@ -13,6 +13,7 @@ sys.stderr.reconfigure(line_buffering=True)
 import sys
 import os
 import argparse
+import yaml
 
 # 导入自定义模块
 from point_reader import read_points
@@ -28,6 +29,8 @@ def main():
     parser.add_argument('--mode', type=str, default='current',
                         choices=['current', 'previous', 'both'],
                         help='影像下载模式：current(当前影像), previous(前一个时刻影像), both(两者都下载)')
+    parser.add_argument('--data-source', type=str, default=None,
+                        help='数据源名称：ESRI World Imagery, Google Earth, Bing Maps, OpenStreetMap')
     args = parser.parse_args()
 
     download_mode = args.mode
@@ -40,6 +43,24 @@ def main():
     # 从配置文件读取缓冲区尺寸
     buffer_sizes = PROCESSING.get('buffer_sizes', [1000, 2000])  # 默认缓冲区尺寸（米）
 
+    # 从命令行参数或配置文件读取数据源配置
+    config_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+    default_data_source = 'ESRI World Imagery'
+    
+    # 优先使用命令行参数
+    if args.data_source:
+        default_data_source = args.data_source
+        print(f"使用命令行指定的数据源: {default_data_source}")
+    elif os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            data_source_config = config.get('data_source', {})
+            default_data_source = data_source_config.get('default_data_source', 'ESRI World Imagery')
+            print(f"从配置文件读取的数据源: {default_data_source}")
+        except Exception as e:
+            print(f"警告: 读取数据源配置失败: {e}")
+
     print("="*60)
     print("开始处理：从点数据到带地理参考的TIFF影像")
     print("="*60)
@@ -50,6 +71,7 @@ def main():
     print(f"  输出前缀：{output_prefix}")
     print(f"  TIFF输出目录：{tiff_output_dir}")
     print(f"  下载模式：{download_mode}")
+    print(f"  默认数据源：{default_data_source}")
     print("="*60)
 
     # 1. 读取点数据
@@ -72,7 +94,7 @@ def main():
         # 3. 处理KML生成TIFF
         print(f"\n3. 处理KML生成TIFF影像...")
         converter = SatelliteToTiffConverter()
-        converter.process_kml_to_tiff(kml_path, tiff_output_dir, download_mode=download_mode)
+        converter.process_kml_to_tiff(kml_path, tiff_output_dir, download_mode=download_mode, service_name=default_data_source)
 
     print("\n" + "="*60)
     print("所有处理完成！")
