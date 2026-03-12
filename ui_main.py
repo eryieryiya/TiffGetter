@@ -210,7 +210,8 @@ class ConfigUI:
             # 获取当前配置
             current_config = {
                 'paths': self.path_panel.get_config(),
-                'processing': self.processing_panel.get_config()
+                'processing': self.processing_panel.get_config(),
+                'data_source': self.data_source_panel.get_config()
             }
             
             # 合并到现有配置
@@ -231,6 +232,7 @@ class ConfigUI:
             self.config = self.load_config()
             self.path_panel.set_config(self.config)
             self.processing_panel.set_config(self.config)
+            self.data_source_panel.set_config(self.config)
             messagebox.showinfo("成功", "配置已从config.yaml加载")
         except Exception as e:
             messagebox.showerror("错误", f"加载配置失败: {e}")
@@ -663,15 +665,17 @@ class DataSourceConfigPanel(ttk.Frame):
     def set_config(self, config):
         """设置配置"""
         # 设置默认数据源
-        satellite_services = config.get('satellite_services', [])
-        if satellite_services:
-            self.default_data_source_var.set(satellite_services[0].get('name', 'ESRI World Imagery'))
-        else:
-            self.default_data_source_var.set('ESRI World Imagery')
+        data_source_config = config.get('data_source', {})
+        default_data_source = data_source_config.get('default_data_source', 'ESRI World Imagery')
+        self.default_data_source_var.set(default_data_source)
+        
+        # 设置自定义服务
+        custom_service = data_source_config.get('custom_service', '')
+        self.custom_service_var.set(custom_service)
         
         # 设置历史影像服务
-        wayback_services = config.get('wayback_services', {})
-        self.wayback_enabled_var.set(wayback_services.get('enabled', False))
+        wayback_enabled = data_source_config.get('wayback_enabled', False)
+        self.wayback_enabled_var.set(wayback_enabled)
     
     def get_config(self):
         """获取配置"""

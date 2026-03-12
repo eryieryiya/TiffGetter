@@ -31,6 +31,33 @@ DEFAULT_CONFIG = {
                 'Referer': 'https://www.arcgis.com/',
                 'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
             }
+        },
+        {
+            'name': 'Google Earth',
+            'url_template': 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+            'max_zoom': 20,
+            'headers': {
+                'Referer': 'https://www.google.com/',
+                'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+            }
+        },
+        {
+            'name': 'Bing Maps',
+            'url_template': 'https://t0.ssl.ak.dynamic.tiles.virtualearth.net/comp/ch/{z}/{y}/{x}?mkt=en-US&it=G,L&og=191&n=z',
+            'max_zoom': 19,
+            'headers': {
+                'Referer': 'https://www.bing.com/',
+                'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+            }
+        },
+        {
+            'name': 'OpenStreetMap',
+            'url_template': 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+            'max_zoom': 19,
+            'headers': {
+                'Referer': 'https://www.openstreetmap.org/',
+                'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+            }
         }
     ],
     'coordinate_systems': {
