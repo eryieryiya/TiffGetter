@@ -9,62 +9,60 @@ def read_kml_points(input_path):
     points = []
     feature_count = 0
     
-    # 打开KML文件
-    driver = ogr.GetDriverByName('KML')
-    if not driver:
-        print("错误：GDAL未找到KML驱动")
-        sys.exit(1)
+    print("开始读取KML文件...")
+    print(f"KML文件路径: {input_path}")
     
-    data_source = driver.Open(input_path, 0)  # 0表示只读
-    if not data_source:
-        print(f"错误：无法打开文件 {input_path}")
-        sys.exit(1)
+    import re
     
-    # 遍历所有图层（KML中的Folder对应图层）
-    layer_count = data_source.GetLayerCount()
-    print(f"KML文件包含 {layer_count} 个图层")
-    
-    for layer_idx in range(layer_count):
-        layer = data_source.GetLayer(layer_idx)
-        if not layer:
-            continue
+    try:
+        # 读取KML文件内容
+        with open(input_path, 'r', encoding='utf-8') as f:
+            content = f.read()
         
-        layer_name = layer.GetName()
-        print(f"正在读取图层：{layer_name}")
+        # 使用正则表达式提取Placemark块
+        placemark_pattern = re.compile(r'<Placemark[^>]*>(.*?)</Placemark>', re.DOTALL)
+        placemarks = placemark_pattern.findall(content)
         
-        # 遍历图层中的所有要素
-        layer.ResetReading()
-        for feature in layer:
+        print(f"KML文件包含 {len(placemarks)} 个Placemark")
+        
+        # 遍历每个Placemark
+        for placemark_content in placemarks:
             feature_count += 1
-            geom = feature.GetGeometryRef()
             
-            if not geom:
+            # 使用正则表达式提取coordinates标签中的内容
+            coords_pattern = re.compile(r'<coordinates[^>]*>(.*?)</coordinates>', re.DOTALL)
+            coords_match = coords_pattern.search(placemark_content)
+            
+            if not coords_match:
+                print(f"  要素 {feature_count}：没有coordinates元素，跳过")
                 continue
             
-            # 直接尝试获取坐标，不依赖几何类型判断
-            try:
-                # 尝试直接获取X,Y坐标
-                lon = geom.GetX()
-                lat = geom.GetY()
-                points.append((feature_count, lon, lat))
-                print(f"  要素 {feature_count}：找到点坐标 {lon}, {lat}")
-            except:
-                # 如果直接获取坐标失败，尝试其他方法
+            coords_text = coords_match.group(1).strip()
+            print(f"  要素 {feature_count}：coordinates文本: {coords_text}")
+            
+            # 解析坐标
+            coords = coords_text.split(',')
+            
+            if len(coords) >= 2:
                 try:
-                    # 获取几何边界框的中心点
-                    envelope = geom.GetEnvelope()
-                    if envelope:
-                        min_x, max_x, min_y, max_y = envelope
-                        lon = (min_x + max_x) / 2
-                        lat = (min_y + max_y) / 2
-                        points.append((feature_count, lon, lat))
-                        print(f"  要素 {feature_count}：从边界框找到点坐标 {lon}, {lat}")
-                except:
-                    print(f"  要素 {feature_count}：无法提取坐标，跳过")
-    
-    data_source = None  # 关闭数据源
-    print(f"共处理 {feature_count} 个要素，找到 {len(points)} 个点")
-    return points
+                    lon = float(coords[0])
+                    lat = float(coords[1])
+                    # 保持与read_shp_points函数一致的返回格式：(feature_id, lon, lat)
+                    points.append((feature_count, lon, lat))
+                    print(f"  要素 {feature_count}：找到点坐标 {lon}, {lat}")
+                except ValueError as e:
+                    print(f"  要素 {feature_count}：坐标格式错误，跳过 - {e}")
+            else:
+                print(f"  要素 {feature_count}：坐标数据不足，跳过")
+        
+        print(f"共处理 {feature_count} 个要素，找到 {len(points)} 个点")
+        return points
+        
+    except Exception as e:
+        print(f"错误：读取KML文件时发生异常 - {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 
 def read_shp_points(input_path):
@@ -96,9 +94,14 @@ def read_shp_points(input_path):
     # 获取图层坐标系
     src_srs = layer.GetSpatialRef()
     
-    # 创建WGS84坐标系
+    # 创建WGS84坐标系，设置坐标轴顺序为经度在前
     wgs84_srs = osr.SpatialReference()
     wgs84_srs.ImportFromEPSG(4326)
+    wgs84_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    
+    # 如果源坐标系存在，也设置坐标轴顺序
+    if src_srs:
+        src_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     
     # 创建坐标转换器
     transform = None
