@@ -535,11 +535,24 @@ class SatelliteToTiffConverter:
             tree = ET.parse(kml_file_path)
             root = tree.getroot()
             
-            # KML命名空间处理
-            ns = {'http://www.opengis.net/kml/2.2': ''}
+            # 提取命名空间
+            namespace = ''
+            if '}' in root.tag:
+                namespace = root.tag.split('}')[0].strip('{')
+            
+            # 构建命名空间映射
+            ns = {}
+            if namespace:
+                ns['kml'] = namespace
             
             # 查找所有Placemark元素
-            for placemark in root.findall('.//{http://www.opengis.net/kml/2.2}Placemark', namespaces=ns):
+            placemarks = []
+            if namespace:
+                placemarks = root.findall('.//kml:Placemark', namespaces=ns)
+            else:
+                placemarks = root.findall('.//Placemark')
+            
+            for placemark in placemarks:
                 buffer_info = {}
                 
                 # 提取ID
@@ -547,18 +560,38 @@ class SatelliteToTiffConverter:
                 buffer_info['id'] = buffer_id
                 
                 # 提取扩展数据
-                extended_data = placemark.find('.//{http://www.opengis.net/kml/2.2}ExtendedData', namespaces=ns)
+                extended_data = None
+                if namespace:
+                    extended_data = placemark.find('.//kml:ExtendedData', namespaces=ns)
+                else:
+                    extended_data = placemark.find('.//ExtendedData')
+                
                 if extended_data is not None:
-                    schema_data = extended_data.find('.//{http://www.opengis.net/kml/2.2}SchemaData', namespaces=ns)
+                    schema_data = None
+                    if namespace:
+                        schema_data = extended_data.find('.//kml:SchemaData', namespaces=ns)
+                    else:
+                        schema_data = extended_data.find('.//SchemaData')
+                    
                     if schema_data is not None:
-                        for simple_data in schema_data.findall('.//{http://www.opengis.net/kml/2.2}SimpleData', namespaces=ns):
+                        simple_data_list = []
+                        if namespace:
+                            simple_data_list = schema_data.findall('.//kml:SimpleData', namespaces=ns)
+                        else:
+                            simple_data_list = schema_data.findall('.//SimpleData')
+                        
+                        for simple_data in simple_data_list:
                             name = simple_data.get('name')
                             value = simple_data.text
                             if name and value:
                                 buffer_info[name] = value
                 
                 # 提取坐标
-                coordinates_elem = placemark.find('.//{http://www.opengis.net/kml/2.2}coordinates', namespaces=ns)
+                coordinates_elem = None
+                if namespace:
+                    coordinates_elem = placemark.find('.//kml:coordinates', namespaces=ns)
+                else:
+                    coordinates_elem = placemark.find('.//coordinates')
                 if coordinates_elem is not None and coordinates_elem.text:
                     coords_text = coordinates_elem.text.strip()
                     coords_list = re.findall(r'[-+]?[0-9]*\.?[0-9]+,[-+]?[0-9]*\.?[0-9]+', coords_text)
@@ -688,7 +721,8 @@ class SatelliteToTiffConverter:
             url = url_template.format(z=zoom, x=x, y=y)
         
         headers = service.get('headers', {}).copy()
-        headers['User-Agent'] = self.get_random_user_agent()
+        if 'User-Agent' not in headers:
+            headers['User-Agent'] = self.get_random_user_agent()
         headers['Accept-Encoding'] = 'gzip, deflate, br'
         headers['Connection'] = 'keep-alive'
         

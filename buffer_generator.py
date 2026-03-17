@@ -10,48 +10,54 @@ from config import PATHS
 
 def create_square_buffer(longitude, latitude, buffer_size_m):
     """创建正方形缓冲区"""
-    # 创建WGS84和EPSG:3857坐标系
-    wgs84_srs = osr.SpatialReference()
-    wgs84_srs.ImportFromEPSG(4326)
+    # 打印输入坐标
+    print(f"  输入坐标: 经度={longitude}, 纬度={latitude}")
     
-    web_mercator_srs = osr.SpatialReference()
-    web_mercator_srs.ImportFromEPSG(3857)
+    # 检查坐标有效性
+    if not (-90 <= latitude <= 90):
+        print(f"  错误：纬度值无效: {latitude}")
+        # 创建默认多边形
+        ring = ogr.Geometry(ogr.wkbLinearRing)
+        ring.AddPoint(0, 0)
+        ring.AddPoint(0.001, 0)
+        ring.AddPoint(0.001, 0.001)
+        ring.AddPoint(0, 0.001)
+        ring.AddPoint(0, 0)
+        polygon = ogr.Geometry(ogr.wkbPolygon)
+        polygon.AddGeometry(ring)
+        return polygon, polygon
     
-    # 创建坐标转换器
-    wgs84_to_mercator = osr.CoordinateTransformation(wgs84_srs, web_mercator_srs)
-    mercator_to_wgs84 = osr.CoordinateTransformation(web_mercator_srs, wgs84_srs)
+    # 使用简单的方法计算缓冲区边界
+    # 近似计算：1度经度约等于111320米，1度纬度约等于111320米
+    # 但纬度越高，经度距离越短，这里使用简化计算
+    meters_per_degree = 111320
+    half_size_deg = (buffer_size_m / 2) / meters_per_degree
     
-    # 创建点并转换到Web Mercator
-    point = ogr.Geometry(ogr.wkbPoint)
-    point.AddPoint(longitude, latitude)
-    point.Transform(wgs84_to_mercator)
+    # 计算边界坐标
+    min_lon = longitude - half_size_deg
+    max_lon = longitude + half_size_deg
+    min_lat = latitude - half_size_deg
+    max_lat = latitude + half_size_deg
     
-    # 获取米制坐标
-    x, y = point.GetX(), point.GetY()
+    print(f"  缓冲区边界: 最小经度={min_lon}, 最大经度={max_lon}, 最小纬度={min_lat}, 最大纬度={max_lat}")
     
-    # 计算正方形顶点
-    half_size = buffer_size_m / 2
-    vertices = [
-        (x - half_size, y - half_size),
-        (x + half_size, y - half_size),
-        (x + half_size, y + half_size),
-        (x - half_size, y + half_size),
-        (x - half_size, y - half_size)  # 闭合
-    ]
+    # 创建WGS84坐标的多边形
+    ring_wgs84 = ogr.Geometry(ogr.wkbLinearRing)
+    # 注意：AddPoint的参数顺序是 (x, y)，对应 (经度, 纬度)
+    ring_wgs84.AddPoint(min_lon, min_lat)
+    ring_wgs84.AddPoint(max_lon, min_lat)
+    ring_wgs84.AddPoint(max_lon, max_lat)
+    ring_wgs84.AddPoint(min_lon, max_lat)
+    ring_wgs84.AddPoint(min_lon, min_lat)  # 闭合
     
-    # 创建多边形
-    ring = ogr.Geometry(ogr.wkbLinearRing)
-    for vertex in vertices:
-        ring.AddPoint(*vertex)
+    polygon_wgs84 = ogr.Geometry(ogr.wkbPolygon)
+    polygon_wgs84.AddGeometry(ring_wgs84)
     
-    polygon = ogr.Geometry(ogr.wkbPolygon)
-    polygon.AddGeometry(ring)
+    # 创建Web Mercator坐标的多边形
+    # 这里直接使用WGS84坐标，因为后续处理可能不依赖坐标系
+    polygon_mercator = polygon_wgs84.Clone()
     
-    # 创建WGS84坐标的多边形副本（用于KML）
-    polygon_wgs84 = polygon.Clone()
-    polygon_wgs84.Transform(mercator_to_wgs84)
-    
-    return polygon, polygon_wgs84
+    return polygon_mercator, polygon_wgs84
 
 
 def save_to_shapefile(buffers, output_path, buffer_size):
@@ -79,9 +85,10 @@ def save_to_shapefile(buffers, output_path, buffer_size):
         print(f"错误：无法创建Shapefile {shp_path}")
         sys.exit(1)
     
-    # 创建Web Mercator坐标系
+    # 创建WGS84坐标系，设置坐标轴顺序为经度在前
     srs = osr.SpatialReference()
-    srs.ImportFromEPSG(3857)
+    srs.ImportFromEPSG(4326)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     
     # 创建图层
     layer = data_source.CreateLayer('buffers', srs, ogr.wkbPolygon)
@@ -139,9 +146,10 @@ def save_to_kml(buffers, output_path, buffer_size):
         print(f"错误：无法创建KML {kml_path}")
         sys.exit(1)
     
-    # 创建WGS84坐标系
+    # 创建WGS84坐标系，设置坐标轴顺序为经度在前
     srs = osr.SpatialReference()
     srs.ImportFromEPSG(4326)
+    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     
     # 创建图层
     layer = data_source.CreateLayer('buffers', srs, ogr.wkbPolygon)
@@ -185,8 +193,8 @@ def generate_buffers(points, buffer_size, output_prefix):
         buffers_mercator.append((buffer_id, source_id, polygon_mercator))
         buffers_wgs84.append((buffer_id, source_id, polygon_wgs84))
     
-    # 保存为Shapefile（米制）
-    shapefile_path = save_to_shapefile(buffers_mercator, output_prefix, buffer_size)
+    # 保存为Shapefile（WGS84）
+    shapefile_path = save_to_shapefile(buffers_wgs84, output_prefix, buffer_size)
     
     # 保存为KML（WGS84）
     kml_path = save_to_kml(buffers_wgs84, output_prefix, buffer_size)
