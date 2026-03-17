@@ -68,3 +68,5 @@ Desktop.ini
 
 # Trae IDE 相关
 .trae/
+# 忽略模块版本压缩包
+moudual_version.zip
