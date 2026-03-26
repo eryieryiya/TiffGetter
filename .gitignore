@@ -40,7 +40,7 @@ env/
 # Project specific - 忽略所有输出数据
 data/
 # 忽略配置文件（包含敏感信息）
-config.yaml
+# config.yaml
 # 忽略日志文件
 *.log
 # 忽略临时文件

@@ -304,13 +304,52 @@ class ConfigUI:
                         progress_percent = (processed / total) * 100 if total > 0 else 0
                         self.progress_var.set(progress_percent)
                         self.progress_label.config(text=f"{processed}/{total}")
+                        self.status_label.config(text=f"处理缓冲区 {processed}/{total}")
                         self.root.update()
+                    
+                    # 检测历史影像日期获取
+                    elif "成功获取" in line and "个影像服务版本" in line:
+                        version_match = re.search(r'成功获取\s+(\d+)\s+个影像服务版本', line)
+                        if version_match:
+                            version_count = version_match.group(1)
+                            self.status_label.config(text=f"获取到 {version_count} 个历史影像版本")
+                            self.root.update()
+                    
+                    # 检测瓦片下载进度
+                    elif "开始下载" in line and "个瓦片" in line:
+                        tile_match = re.search(r'开始下载\s+(\d+)\s+个瓦片', line)
+                        if tile_match:
+                            tile_count = tile_match.group(1)
+                            self.status_label.config(text=f"开始下载 {tile_count} 个瓦片")
+                            self.root.update()
+                    
+                    # 检测瓦片下载进度百分比
+                    elif "进度:" in line:
+                        progress_match = re.search(r'进度:\s+(\d+)/(\d+)\s+\((\d+\.\d+)%\)', line)
+                        if progress_match:
+                            current = progress_match.group(1)
+                            total_tiles = progress_match.group(2)
+                            percent = progress_match.group(3)
+                            self.status_label.config(text=f"下载进度: {current}/{total_tiles} ({percent}%)")
+                            # 更新进度条
+                            progress_percent = float(percent)
+                            self.progress_var.set(progress_percent)
+                            self.progress_label.config(text=f"{current}/{total_tiles}")
+                            self.root.update()
+                    
+                    # 检测下载完成
+                    elif "=== 下载完成 ===" in line:
+                        self.status_label.config(text="下载完成，开始拼接瓦片")
+                        self.root.update()
+                    
+                    # 检测处理完成
                     elif "所有处理完成" in line:
                         # 所有处理完成，更新为最终进度
                         processed = total
                         progress_percent = 100
                         self.progress_var.set(progress_percent)
                         self.progress_label.config(text=f"{processed}/{total}")
+                        self.status_label.config(text="所有处理完成")
                         self.root.update()
                     
                     # 更新进度条
@@ -659,6 +698,14 @@ class DataSourceConfigPanel(ttk.Frame):
         self.wayback_enabled_var = tk.BooleanVar()
         ttk.Checkbutton(data_source_frame, text="启用ESRI Wayback历史影像服务", variable=self.wayback_enabled_var).grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
         
+        # 历史影像时间点选择
+        ttk.Label(data_source_frame, text="历史影像时间点:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.history_date_var = tk.StringVar(value='自动选择')
+        history_dates = ['自动选择', '2023-01-01', '2022-01-01', '2021-01-01', '2020-01-01', '2019-01-01']
+        history_date_combo = ttk.Combobox(data_source_frame, textvariable=self.history_date_var, values=history_dates, width=20)
+        history_date_combo.grid(row=3, column=1, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(data_source_frame, text="(选择特定的历史时间点)").grid(row=3, column=2, sticky=tk.W, pady=5)
+        
         # 设置初始值
         self.set_config(self.config)
     
@@ -676,13 +723,18 @@ class DataSourceConfigPanel(ttk.Frame):
         # 设置历史影像服务
         wayback_enabled = data_source_config.get('wayback_enabled', False)
         self.wayback_enabled_var.set(wayback_enabled)
+        
+        # 设置历史影像时间点
+        history_date = data_source_config.get('history_date', '自动选择')
+        self.history_date_var.set(history_date)
     
     def get_config(self):
         """获取配置"""
         return {
             'default_data_source': self.default_data_source_var.get(),
             'custom_service': self.custom_service_var.get(),
-            'wayback_enabled': self.wayback_enabled_var.get()
+            'wayback_enabled': self.wayback_enabled_var.get(),
+            'history_date': self.history_date_var.get()
         }
 
 
