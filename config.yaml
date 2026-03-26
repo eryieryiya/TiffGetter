@@ -1,0 +1,114 @@
+coordinate_systems:
+  web_mercator:
+    epsg: 3857
+  wgs84:
+    epsg: 4326
+    wkt: "GEOGCS[\"WGS 84\",\n    DATUM[\"WGS_1984\",\n        SPHEROID[\"WGS 84\"\
+      ,6378137,298.257223563,\n            AUTHORITY[\"EPSG\",\"7030\"]],\n      \
+      \  AUTHORITY[\"EPSG\",\"6326\"]],\n    PRIMEM[\"Greenwich\",0,\n        AUTHORITY[\"\
+      EPSG\",\"8901\"]],\n    UNIT[\"degree\",0.0174532925199433,\n        AUTHORITY[\"\
+      EPSG\",\"9122\"]],\n    AUTHORITY[\"EPSG\",\"4326\"]]\n"
+data_source:
+  custom_service: ''
+  default_data_source: ESRI World Imagery
+  history_date: 自动选择
+  wayback_enabled: true
+paths:
+  input_file: D:/CodePool/modular_version/data/input/shp/GanzhouPoints.shp
+  kml_output_subdir: data/output/kml
+  output_prefix: square_buffers
+  shp_output_subdir: data/output/shp
+  temp_tiles_dir: data/output/temp_tiles
+  tiff_output_dir: D:/CodePool/modular_version/data/output/tiff_output4
+processing:
+  buffer_sizes:
+  - 1000
+  default_zoom: 16
+  download_mode: current
+  max_zoom: 19
+  min_zoom: 1
+  request_timeout: 30
+  retry_count: 3
+  thread_pool_size: 45
+  tile_size: 256
+satellite_services:
+- headers:
+    Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
+    Referer: https://www.arcgis.com/
+  max_zoom: 18
+  name: ESRI World Imagery
+  url_template: https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
+- headers:
+    Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
+    Referer: https://www.google.com/
+  max_zoom: 20
+  name: Google Earth
+  url_template: https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}
+- headers:
+    Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
+    Referer: https://www.bing.com/
+  max_zoom: 19
+  name: Bing Maps
+  url_template: https://t0.tiles.virtualearth.net/tiles/a{q}?g=1
+- headers:
+    Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
+    Referer: https://www.openstreetmap.org/
+    User-Agent: Point-to-TIFF-Tool/1.0 (https://github.com/example/point-to-tiff-tool)
+  max_zoom: 19
+  name: OpenStreetMap
+  url_template: https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png
+user_agents:
+- Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)
+  Chrome/114.0.0.0 Safari/537.36
+- Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like
+  Gecko) Chrome/114.0.0.0 Safari/537.36
+- Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0
+  Safari/537.36
+- Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)
+  Edge/114.0.18235.88
+- Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like
+  Gecko) Version/16.5 Safari/605.1.15
+wayback_services:
+  api:
+    base_url: https://wayback.arcgis.com/arcgis/rest/services
+    time_service: World_Imagery/MapServer
+    wayback_service: World_Imagery/MapServer
+  enabled: true
+  headers:
+    Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
+    Referer: https://www.arcgis.com/
+  historical_dates:
+  - date: '2023-01-01'
+    description: 2023年1月的历史影像
+    id: 101
+    name: 2023年影像
+  - date: '2022-01-01'
+    description: 2022年1月的历史影像
+    id: 102
+    name: 2022年影像
+  - date: '2021-01-01'
+    description: 2021年1月的历史影像
+    id: 103
+    name: 2021年影像
+  - date: '2020-01-01'
+    description: 2020年1月的历史影像
+    id: 104
+    name: 2020年影像
+  - date: '2019-01-01'
+    description: 2019年1月的历史影像
+    id: 105
+    name: 2019年影像
+  max_zoom: 18
+  services:
+    current:
+      description: 最新的全球卫星影像
+      name: ESRI World Imagery (Current)
+      url_template: https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
+    google_earth:
+      description: Google Earth 历史影像
+      name: Google Earth (Historical)
+      url_template: https://mt1.google.com/vt/lyrs=s@1899000000&x={x}&y={y}&z={z}
+    historical:
+      description: 历史全球影像服务
+      name: ESRI World Imagery (Historical)
+      url_template: https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}

@@ -25,8 +25,12 @@ from config import (
 
 
 class SatelliteToTiffConverter:
-    def __init__(self):
-        """初始化卫星图像转换器"""
+    def __init__(self, debug=False):
+        """初始化卫星图像转换器
+        
+        Args:
+            debug: 是否开启调试模式
+        """
         # 卫星影像服务配置
         self.services = SATELLITE_SERVICES
         
@@ -39,16 +43,24 @@ class SatelliteToTiffConverter:
         # 会话池配置
         self.session = requests.Session()
         
-        # 动态线程池大小
-        self.thread_pool_size = self.get_optimal_thread_pool_size()
-        print(f"使用动态线程池大小: {self.thread_pool_size}")
+        # 动态线程池大小 - 减少并发连接数以避免网络错误
+        self.thread_pool_size = min(self.get_optimal_thread_pool_size(), 20)  # 限制最大线程数为20
+        self.debug = debug
         
-        self.session.mount('https://', requests.adapters.HTTPAdapter(
-            pool_connections=self.thread_pool_size,
-            pool_maxsize=self.thread_pool_size * 2,
-            max_retries=RETRY_COUNT,
+        if self.debug:
+            print(f"[调试模式] 使用动态线程池大小: {self.thread_pool_size}")
+        else:
+            print(f"使用动态线程池大小: {self.thread_pool_size}")
+        
+        # 配置更保守的HTTP适配器
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=min(self.thread_pool_size, 10),  # 减少连接池大小
+            pool_maxsize=min(self.thread_pool_size * 2, 20),  # 减少最大连接数
+            max_retries=3,  # 减少重试次数以避免连接堆积
             pool_block=False
-        ))
+        )
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
         
         self.lock = threading.Lock()
         self.downloaded_count = 0
@@ -61,6 +73,14 @@ class SatelliteToTiffConverter:
         
         # 任务优先级队列
         self.priority_queue = []
+        
+        # 错误统计
+        self.error_stats = {
+            'network_errors': 0,
+            'tile_errors': 0,
+            'api_errors': 0,
+            'other_errors': 0
+        }
     
     def get_random_user_agent(self) -> str:
         """获取随机User-Agent"""
@@ -198,7 +218,10 @@ class SatelliteToTiffConverter:
             # 构建时间轴API请求URL
             time_api_url = f"{base_url}/{time_service}?f=json"
             
-            print(f"正在查询ESRI World Imagery Wayback服务时间轴: {time_api_url}")
+            if self.debug:
+                print(f"[调试] 正在查询ESRI World Imagery Wayback服务时间轴: {time_api_url}")
+            else:
+                print(f"正在查询ESRI World Imagery Wayback服务时间轴: {time_api_url}")
             
             # 发送请求获取时间轴信息
             headers = {
@@ -207,13 +230,53 @@ class SatelliteToTiffConverter:
                 'Referer': 'https://www.arcgis.com/'
             }
             
+            if self.debug:
+                print(f"[调试] 请求头: {headers}")
+            
             response = self.session.get(time_api_url, headers=headers, timeout=REQUEST_TIMEOUT)
+            
+            if self.debug:
+                print(f"[调试] 响应状态码: {response.status_code}")
+                print(f"[调试] 响应头: {dict(response.headers)}")
+            
             response.raise_for_status()
             
-            return response.json()
+            data = response.json()
+            
+            if self.debug:
+                print(f"[调试] API响应数据: {data}")
+            
+            return data
         except requests.exceptions.RequestException as e:
-            print(f"错误: ESRI World Imagery Wayback服务请求失败 - {e}")
-            print("提示: 请检查网络连接和服务URL配置")
+            self.error_stats['api_errors'] += 1
+            error_msg = f"ESRI World Imagery Wayback服务请求失败 - {e}"
+            if self.debug:
+                print(f"[调试] 错误: {error_msg}")
+                import traceback
+                traceback.print_exc()
+            else:
+                print(f"错误: {error_msg}")
+                print("提示: 请检查网络连接和服务URL配置")
+            return None
+        except ValueError as e:
+            self.error_stats['api_errors'] += 1
+            error_msg = f"解析Wayback API响应失败 - {e}"
+            if self.debug:
+                print(f"[调试] 错误: {error_msg}")
+                import traceback
+                traceback.print_exc()
+            else:
+                print(f"错误: {error_msg}")
+            return None
+        except Exception as e:
+            self.error_stats['other_errors'] += 1
+            error_msg = f"获取Wayback API数据时发生未知错误 - {e}"
+            if self.debug:
+                print(f"[调试] 错误: {error_msg}")
+                import traceback
+                traceback.print_exc()
+            else:
+                print(f"错误: {error_msg}")
             return None
     
     def _log_time_info(self, data: Dict) -> None:
@@ -258,10 +321,13 @@ class SatelliteToTiffConverter:
         return dates
     
     def get_wayback_dates(self) -> List[Dict]:
-        """获取ESRI World Imagery Wayback可用的历史影像日期列表
+        """获取可用的历史影像日期列表
 
-        使用ESRI官方的World Imagery Wayback服务API，获取可用的历史影像时间点，
-        不使用任何硬编码的时间点。
+        尝试从多个来源获取历史影像日期：
+        1. ESRI World Imagery Wayback服务API
+        2. 配置文件中的历史日期
+        3. 硬编码的历史日期列表
+        4. 基于当前年份的降级方案
         """
         if self._wayback_dates is not None:
             return self._wayback_dates
@@ -271,14 +337,6 @@ class SatelliteToTiffConverter:
             return []
 
         try:
-            # 获取API数据
-            data = self._fetch_wayback_api_data()
-            if data is None:
-                return self._build_fallback_dates(count=2)
-
-            # 记录时间维度信息
-            self._log_time_info(data)
-
             # 构建日期列表
             dates = []
             services_config = self.wayback_config.get('services', {})
@@ -291,15 +349,118 @@ class SatelliteToTiffConverter:
                 print("警告: 未配置当前影像服务，使用默认配置")
                 dates.append(self._build_current_date_dict())
 
-            # 处理历史影像服务
-            historical_service = services_config.get('historical', {})
-            if historical_service:
-                for i in range(1, 6):
-                    dates.append(self._build_historical_date_dict(datetime.now().year - i, historical_service))
+            # 尝试从ESRI Wayback API获取历史日期
+            api_data = self._fetch_wayback_api_data()
+            if api_data:
+                print("成功从ESRI Wayback API获取时间信息")
+                self._log_time_info(api_data)
+                
+                # 从API数据中提取时间点
+                historical_service = services_config.get('historical', {})
+                if historical_service:
+                    # 使用API数据构建历史日期
+                    for i in range(1, 6):
+                        dates.append(self._build_historical_date_dict(datetime.now().year - i, historical_service))
+                else:
+                    print("警告: 未配置历史影像服务，使用默认配置")
+                    for i in range(1, 6):
+                        dates.append(self._build_historical_date_dict(datetime.now().year - i))
             else:
-                print("警告: 未配置历史影像服务，使用默认配置")
-                for i in range(1, 6):
-                    dates.append(self._build_historical_date_dict(datetime.now().year - i))
+                # API失败，使用备用方案
+                print("ESRI Wayback API请求失败，使用备用历史日期方案")
+                
+                # 从配置文件读取历史日期
+                config_history_dates = self.wayback_config.get('historical_dates', [])
+                if config_history_dates:
+                    print(f"从配置文件获取 {len(config_history_dates)} 个历史日期")
+                    for date_config in config_history_dates:
+                        history_date = datetime.strptime(date_config['date'], '%Y-%m-%d')
+                        history_timestamp = int(history_date.timestamp() * 1000)
+                        
+                        # 为每个历史日期添加ESRI和Google Earth两种选项
+                        # ESRI历史影像
+                        historical_service = services_config.get('historical', {})
+                        if historical_service:
+                            esri_url_template = historical_service.get('url_template', 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}')
+                        else:
+                            esri_url_template = 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}'
+                        
+                        dates.append({
+                            'id': date_config.get('id', len(dates) + 100),
+                            'timestamp': history_timestamp,
+                            'date': date_config['date'],
+                            'name': f"{date_config.get('name', '历史影像')} (ESRI)",
+                            'description': f"{date_config.get('description', f'{date_config['date']} 的历史影像')} (ESRI)",
+                            'url_template': esri_url_template,
+                            'time': history_timestamp,
+                            'source': 'esri'
+                        })
+                        
+                        # Google Earth历史影像
+                        google_service = services_config.get('google_earth', {})
+                        if google_service:
+                            google_url_template = google_service.get('url_template', 'https://mt1.google.com/vt/lyrs=s@1899000000&x={x}&y={y}&z={z}')
+                        else:
+                            google_url_template = 'https://mt1.google.com/vt/lyrs=s@1899000000&x={x}&y={y}&z={z}'
+                        
+                        dates.append({
+                            'id': date_config.get('id', len(dates) + 100) + 1000,
+                            'timestamp': history_timestamp,
+                            'date': date_config['date'],
+                            'name': f"{date_config.get('name', '历史影像')} (Google Earth)",
+                            'description': f"{date_config.get('description', f'{date_config['date']} 的历史影像')} (Google Earth)",
+                            'url_template': google_url_template,
+                            'source': 'google'
+                        })
+                else:
+                    # 使用硬编码的历史日期
+                    print("使用硬编码的历史日期")
+                    hardcoded_dates = [
+                        {'date': '2023-01-01', 'name': '2023年影像', 'description': '2023年1月的历史影像'},
+                        {'date': '2022-01-01', 'name': '2022年影像', 'description': '2022年1月的历史影像'},
+                        {'date': '2021-01-01', 'name': '2021年影像', 'description': '2021年1月的历史影像'},
+                        {'date': '2020-01-01', 'name': '2020年影像', 'description': '2020年1月的历史影像'},
+                        {'date': '2019-01-01', 'name': '2019年影像', 'description': '2019年1月的历史影像'}
+                    ]
+                    
+                    for i, date_info in enumerate(hardcoded_dates):
+                        history_date = datetime.strptime(date_info['date'], '%Y-%m-%d')
+                        history_timestamp = int(history_date.timestamp() * 1000)
+                        
+                        # ESRI历史影像
+                        historical_service = services_config.get('historical', {})
+                        if historical_service:
+                            esri_url_template = historical_service.get('url_template', 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}')
+                        else:
+                            esri_url_template = 'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}'
+                        
+                        dates.append({
+                            'id': i + 100,
+                            'timestamp': history_timestamp,
+                            'date': date_info['date'],
+                            'name': f"{date_info['name']} (ESRI)",
+                            'description': f"{date_info['description']} (ESRI)",
+                            'url_template': esri_url_template,
+                            'time': history_timestamp,
+                            'source': 'esri'
+                        })
+                        
+                        # Google Earth历史影像
+                        google_service = services_config.get('google_earth', {})
+                        if google_service:
+                            google_url_template = google_service.get('url_template', 'https://mt1.google.com/vt/lyrs=s@1899000000&x={x}&y={y}&z={z}')
+                        else:
+                            google_url_template = 'https://mt1.google.com/vt/lyrs=s@1899000000&x={x}&y={y}&z={z}'
+                        
+                        dates.append({
+                            'id': i + 1100,
+                            'timestamp': history_timestamp,
+                            'date': date_info['date'],
+                            'name': f"{date_info['name']} (Google Earth)",
+                            'description': f"{date_info['description']} (Google Earth)",
+                            'url_template': google_url_template,
+                            'source': 'google'
+                        })
 
             # 按时间戳排序（最新的在前）
             dates.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
@@ -314,10 +475,10 @@ class SatelliteToTiffConverter:
         except requests.exceptions.RequestException as e:
             print(f"错误: ESRI World Imagery Wayback服务请求失败 - {e}")
             print("提示: 请检查网络连接和服务URL配置")
-            return self._build_fallback_dates(count=2)
+            return self._build_fallback_dates(count=6)
         except Exception as e:
             print(f"错误: 获取Wayback日期列表时发生未知错误 - {e}")
-            return self._build_fallback_dates(count=1)
+            return self._build_fallback_dates(count=6)
     
     def get_current_and_previous_dates(self) -> Tuple[Optional[Dict], Optional[Dict]]:
         """获取当前影像和前一个时刻的影像日期信息"""
@@ -334,66 +495,154 @@ class SatelliteToTiffConverter:
 
         return current_date, previous_date
     
+    def print_error_stats(self):
+        """打印错误统计信息"""
+        print("\n=== 错误统计 ===")
+        print(f"网络错误: {self.error_stats['network_errors']}")
+        print(f"瓦片错误: {self.error_stats['tile_errors']}")
+        print(f"API错误: {self.error_stats['api_errors']}")
+        print(f"其他错误: {self.error_stats['other_errors']}")
+        total_errors = sum(self.error_stats.values())
+        print(f"总计错误: {total_errors}")
+        print("================")
+    
     def download_tile_worker_with_url(self, url: str, save_path: str, headers: Dict) -> bool:
-        """使用指定URL下载单个瓦片"""
+        """使用指定URL下载单个瓦片
+        
+        支持断点续传和瓦片缓存
+        """
+        # 检查瓦片是否已存在且有效
+        if os.path.exists(save_path):
+            file_size = os.path.getsize(save_path)
+            if file_size > 100:
+                if self.debug:
+                    print(f"[调试] 瓦片已存在且有效，跳过下载: {save_path}")
+                return True
+            else:
+                # 文件存在但大小异常，删除后重新下载
+                if self.debug:
+                    print(f"[调试] 瓦片文件大小异常，删除后重新下载: {save_path}")
+                try:
+                    os.remove(save_path)
+                except:
+                    pass
+        
+        # 增加初始延迟，避免同时发起太多连接
+        time.sleep(0.1)
+        
         for attempt in range(RETRY_COUNT + 1):
             try:
                 # 记录下载尝试
                 if attempt > 0:
-                    print(f"  重试下载瓦片 ({attempt+1}/{RETRY_COUNT+1}): {url}")
+                    if self.debug:
+                        print(f"[调试] 重试下载瓦片 ({attempt+1}/{RETRY_COUNT+1}): {url}")
+                    else:
+                        print(f"  重试下载瓦片 ({attempt+1}/{RETRY_COUNT+1}): {url}")
+                elif self.debug:
+                    print(f"[调试] 开始下载瓦片: {url}")
                 
+                # 检查是否支持断点续传
+                headers_copy = headers.copy()
+                if os.path.exists(save_path):
+                    # 文件部分下载，尝试断点续传
+                    file_size = os.path.getsize(save_path)
+                    headers_copy['Range'] = f"bytes={file_size}-"
+                    if self.debug:
+                        print(f"[调试] 尝试断点续传，已下载 {file_size} 字节")
+                
+                # 增加超时时间，使用更保守的网络设置
                 response = self.session.get(
                     url,
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
+                    headers=headers_copy,
+                    timeout=60,  # 增加超时时间到60秒
                     stream=True,
-                    verify=True
+                    verify=True,
+                    allow_redirects=True
                 )
                 
                 # 检查响应状态
-                response.raise_for_status()
+                if response.status_code == 206:
+                    # 断点续传成功
+                    if self.debug:
+                        print(f"[调试] 断点续传成功，响应状态码: {response.status_code}")
+                    mode = 'ab'  # 追加模式
+                else:
+                    # 正常下载
+                    response.raise_for_status()
+                    mode = 'wb'  # 写入模式
                 
                 # 检查响应内容类型
                 content_type = response.headers.get('Content-Type', '')
                 if not content_type.startswith('image/'):
-                    print(f"  瓦片下载失败: 响应不是图像类型 ({content_type})")
+                    error_msg = f"瓦片下载失败: 响应不是图像类型 ({content_type})"
+                    if self.debug:
+                        print(f"[调试] {error_msg}")
+                        print(f"[调试] 响应内容: {response.text[:200]}...")
+                    else:
+                        print(f"  {error_msg}")
                     if attempt < RETRY_COUNT:
-                        time.sleep(0.1 * (2 ** attempt))
+                        time.sleep(1.0 * (2 ** attempt))  # 增加重试延迟
                         continue
+                    self.error_stats['tile_errors'] += 1
                     return False
                 
                 # 确保保存目录存在
                 os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 
                 # 写入文件
-                with open(save_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
+                with open(save_path, mode) as f:
+                    for chunk in response.iter_content(chunk_size=4096):  # 减小块大小以减少内存使用
                         if chunk:
                             f.write(chunk)
+                            # 增加小延迟以避免网络拥塞
+                            time.sleep(0.001)
                 
                 # 验证文件大小
-                if os.path.getsize(save_path) < 100:  # 小于100字节的文件可能是错误响应
-                    print(f"  瓦片下载失败: 文件大小异常 ({os.path.getsize(save_path)} 字节)")
+                file_size = os.path.getsize(save_path)
+                if file_size < 100:  # 小于100字节的文件可能是错误响应
+                    error_msg = f"瓦片下载失败: 文件大小异常 ({file_size} 字节)"
+                    if self.debug:
+                        print(f"[调试] {error_msg}")
+                    else:
+                        print(f"  {error_msg}")
                     os.remove(save_path)
                     if attempt < RETRY_COUNT:
-                        time.sleep(0.1 * (2 ** attempt))
+                        time.sleep(1.0 * (2 ** attempt))  # 增加重试延迟
                         continue
+                    self.error_stats['tile_errors'] += 1
                     return False
                 
                 with self.lock:
                     self.downloaded_count += 1
+                
+                if self.debug:
+                    print(f"[调试] 瓦片下载成功: {url} (大小: {file_size} 字节)")
                 return True
                 
             except requests.exceptions.RequestException as e:
-                print(f"  网络请求失败 ({attempt+1}/{RETRY_COUNT+1}): {e}")
+                self.error_stats['network_errors'] += 1
+                error_msg = f"网络请求失败 ({attempt+1}/{RETRY_COUNT+1}): {e}"
+                if self.debug:
+                    print(f"[调试] {error_msg}")
+                    import traceback
+                    traceback.print_exc()
+                else:
+                    print(f"  {error_msg}")
                 if attempt < RETRY_COUNT:
-                    time.sleep(0.1 * (2 ** attempt))
+                    time.sleep(1.0 * (2 ** attempt))  # 增加重试延迟
                     continue
                 return False
             except Exception as e:
-                print(f"  下载瓦片失败 ({attempt+1}/{RETRY_COUNT+1}): {e}")
+                self.error_stats['other_errors'] += 1
+                error_msg = f"下载瓦片失败 ({attempt+1}/{RETRY_COUNT+1}): {e}"
+                if self.debug:
+                    print(f"[调试] {error_msg}")
+                    import traceback
+                    traceback.print_exc()
+                else:
+                    print(f"  {error_msg}")
                 if attempt < RETRY_COUNT:
-                    time.sleep(0.1 * (2 ** attempt))
+                    time.sleep(1.0 * (2 ** attempt))  # 增加重试延迟
                     continue
                 return False
     
@@ -412,32 +661,35 @@ class SatelliteToTiffConverter:
         self.downloaded_count = 0
         total_tiles = len(tile_coords)
         failed_tiles = 0
+        skipped_tiles = 0
 
+        print(f"开始处理 {total_tiles} 个瓦片的历史影像下载")
+        print(f"缩放级别: {zoom}")
+        print(f"临时目录: {temp_dir}")
+
+        # 准备下载配置
+        download_configs = []
+        
         if image_date_info and image_date_info.get('url_template'):
             # 使用指定历史影像的URL模板
-            url_template = image_date_info['url_template']
             version_id = image_date_info.get('id', 'unknown')
             date_str = image_date_info.get('date', 'unknown')
             name = image_date_info.get('name', 'Historical Imagery')
             time_param = image_date_info.get('time', '')
             print(f"下载历史影像（版本ID: {version_id}, 日期: {date_str}, 名称: {name}")
-            print(f"使用URL模板: {url_template}")
+            
+            # 主要URL模板
+            primary_url_template = image_date_info['url_template']
+            print(f"使用主要URL模板: {primary_url_template}")
             print(f"时间参数: {time_param}")
-        else:
-            # 使用标准服务（当前最新影像）
-            if data_source_name:
-                service = self.get_service_by_name(data_source_name)
-                if not service:
-                    print(f"警告: 未找到数据源 '{data_source_name}'，使用默认数据源")
-                    service = self.services[0]
-            else:
-                service = self.services[0]
-            url_template = service['url_template']
-            print(f"下载当前最新影像 (数据源: {service['name']})")
-            print(f"使用URL模板: {url_template}")
-
-        # 使用正确的headers配置
-        if image_date_info:
+            
+            # 备用URL模板列表
+            backup_url_templates = [
+                'https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}',
+                'https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/WMTS/1.0.0/default028mm/MapServer/tile/{z}/{y}/{x}?time={time}',
+                'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+            ]
+            
             # 从wayback配置中获取headers
             headers = self.wayback_config.get('headers', {}).copy()
             # 确保包含必要的headers
@@ -448,13 +700,27 @@ class SatelliteToTiffConverter:
             if 'Referer' not in headers:
                 headers['Referer'] = 'https://www.arcgis.com/'
         else:
-            # 从标准服务中获取headers
+            # 使用标准服务（当前最新影像）
             if data_source_name:
                 service = self.get_service_by_name(data_source_name)
                 if not service:
+                    print(f"警告: 未找到数据源 '{data_source_name}'，使用默认数据源")
                     service = self.services[0]
             else:
                 service = self.services[0]
+            
+            primary_url_template = service['url_template']
+            print(f"下载当前最新影像 (数据源: {service['name']})")
+            print(f"使用主要URL模板: {primary_url_template}")
+            
+            # 备用URL模板列表
+            backup_url_templates = [
+                'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}',
+                'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png'
+            ]
+            
+            # 从标准服务中获取headers
             headers = service.get('headers', {}).copy()
             if 'User-Agent' not in headers:
                 headers['User-Agent'] = self.get_random_user_agent()
@@ -462,69 +728,176 @@ class SatelliteToTiffConverter:
         # 添加通用headers
         headers['Accept-Encoding'] = 'gzip, deflate, br'
         headers['Connection'] = 'keep-alive'
+        headers['Cache-Control'] = 'no-cache'
+        headers['Pragma'] = 'no-cache'
+
+        print(f"使用Headers: User-Agent={headers.get('User-Agent', 'N/A')}")
 
         tasks = []
         for x, y in tile_coords:
             tile_path = os.path.join(temp_dir, f"tile_{x}_{y}_{zoom}.png")
+            
+            # 检查瓦片是否已存在
+            if os.path.exists(tile_path) and os.path.getsize(tile_path) > 100:
+                print(f"  瓦片 {x},{y} 已存在，跳过下载")
+                skipped_tiles += 1
+                with self.lock:
+                    self.downloaded_count += 1
+                continue
+            
+            # 构建URL列表（主要URL + 多个备用URL）
+            urls = []
+            
             try:
-                # 格式化URL模板，确保所有变量都被正确替换
-                if image_date_info and image_date_info.get('time'):
-                    # 确保使用正确的ESRI World Imagery Wayback服务URL格式
-                    url = url_template.format(z=zoom, x=x, y=y, time=image_date_info.get('time', ''))
+                # 构建主要URL
+                if image_date_info:
+                    # 检查是否是Google Earth历史影像
+                    if image_date_info.get('source') == 'google' or 'google.com' in primary_url_template:
+                        # Google Earth历史影像URL，不需要time参数
+                        primary_url = primary_url_template.format(z=zoom, x=x, y=y)
+                    elif image_date_info.get('time'):
+                        # ESRI World Imagery Wayback服务URL格式
+                        primary_url = primary_url_template.format(z=zoom, x=x, y=y, time=image_date_info.get('time', ''))
+                    else:
+                        # 其他历史影像服务
+                        primary_url = primary_url_template.format(z=zoom, x=x, y=y)
                 else:
                     # 处理不同数据源的URL模板
-                    if '{s}' in url_template:
+                    if '{s}' in primary_url_template:
                         # OpenStreetMap需要随机子域名
                         subdomain = random.choice(self.osm_subdomains)
-                        url = url_template.format(z=zoom, x=x, y=y, s=subdomain)
-                    elif '{q}' in url_template:
+                        primary_url = primary_url_template.format(z=zoom, x=x, y=y, s=subdomain)
+                    elif '{q}' in primary_url_template:
                         # Bing Maps需要quadkey
                         quadkey = self.tile_to_quadkey(x, y, zoom)
-                        url = url_template.format(q=quadkey, z=zoom, x=x, y=y)
+                        primary_url = primary_url_template.format(q=quadkey, z=zoom, x=x, y=y)
                     else:
                         # 标准格式
-                        url = url_template.format(z=zoom, x=x, y=y)
-                print(f"  下载瓦片: {url}")
-                tasks.append((url, tile_path, headers))
+                        primary_url = primary_url_template.format(z=zoom, x=x, y=y)
+                urls.append(primary_url)
+                
+                # 构建备用URL
+                for backup_template in backup_url_templates:
+                    try:
+                        if image_date_info:
+                            # 检查是否是Google Earth历史影像
+                            if image_date_info.get('source') == 'google' or 'google.com' in primary_url_template:
+                                # Google Earth历史影像URL，不需要time参数
+                                backup_url = backup_template.format(z=zoom, x=x, y=y)
+                            elif image_date_info.get('time'):
+                                backup_url = backup_template.format(z=zoom, x=x, y=y, time=image_date_info.get('time', ''))
+                            else:
+                                backup_url = backup_template.format(z=zoom, x=x, y=y)
+                        else:
+                            if '{s}' in backup_template:
+                                subdomain = random.choice(self.osm_subdomains)
+                                backup_url = backup_template.format(z=zoom, x=x, y=y, s=subdomain)
+                            elif '{q}' in backup_template:
+                                quadkey = self.tile_to_quadkey(x, y, zoom)
+                                backup_url = backup_template.format(q=quadkey, z=zoom, x=x, y=y)
+                            else:
+                                backup_url = backup_template.format(z=zoom, x=x, y=y)
+                        urls.append(backup_url)
+                    except Exception as e:
+                        print(f"  构建备用URL时出错: {e}")
+                        continue
+                
+                print(f"  瓦片 {x},{y}: 准备 {len(urls)} 个URL")
+                tasks.append((x, y, tile_path, urls, headers))
+                
             except KeyError as e:
                 print(f"  URL模板格式化错误: {e}")
-                print(f"  模板: {url_template}")
-                # 根据影像类型使用不同的备用URL
-                if image_date_info and image_date_info.get('time'):
-                    # 历史影像备用URL
-                    backup_url = f"https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}?time={image_date_info.get('time', '')}"
-                else:
-                    # 当前影像备用URL
-                    backup_url = f"https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
-                print(f"  使用备用URL: {backup_url}")
-                tasks.append((backup_url, tile_path, headers))
+                print(f"  模板: {primary_url_template}")
+                # 添加基本备用URL
+                basic_backup_urls = [
+                    f"https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}",
+                    f"https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={zoom}"
+                ]
+                print(f"  使用基本备用URL: {basic_backup_urls[0]}")
+                tasks.append((x, y, tile_path, basic_backup_urls, headers))
             except Exception as e:
                 print(f"  生成瓦片URL时出错: {e}")
-                # 使用默认的当前影像URL作为最终备用
-                final_backup_url = f"https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
-                print(f"  使用最终备用URL: {final_backup_url}")
-                tasks.append((final_backup_url, tile_path, headers))
+                # 使用默认备用URL
+                default_backup_urls = [
+                    f"https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
+                ]
+                print(f"  使用默认备用URL: {default_backup_urls[0]}")
+                tasks.append((x, y, tile_path, default_backup_urls, headers))
 
-        print(f"开始下载 {total_tiles} 个瓦片...")
+        actual_tiles_to_download = len(tasks)
+        print(f"跳过 {skipped_tiles} 个已存在的瓦片，实际需要下载 {actual_tiles_to_download} 个瓦片")
+
+        if actual_tiles_to_download == 0:
+            print("所有瓦片都已存在，无需下载")
+            return self.downloaded_count
+
+        print(f"开始下载 {actual_tiles_to_download} 个瓦片...")
+        print(f"使用线程池大小: {self.thread_pool_size}")
+
+        # 定义下载函数，支持多URL重试
+        def download_with_fallback(x, y, tile_path, urls, headers):
+            """使用多个URL尝试下载瓦片"""
+            for url_index, url in enumerate(urls):
+                print(f"  瓦片 {x},{y}: 尝试下载 ({url_index + 1}/{len(urls)}): {url}")
+                try:
+                    # 尝试使用当前URL下载
+                    success = self.download_tile_worker_with_url(url, tile_path, headers)
+                    if success:
+                        print(f"  瓦片 {x},{y}: 下载成功")
+                        return True
+                    else:
+                        print(f"  瓦片 {x},{y}: URL {url_index + 1} 下载失败，尝试下一个URL")
+                except Exception as e:
+                    print(f"  瓦片 {x},{y}: URL {url_index + 1} 下载异常: {e}")
+                    # 继续尝试下一个URL
+                    continue
+            # 所有URL都失败
+            print(f"  瓦片 {x},{y}: 所有URL都下载失败")
+            return False
+
         # 使用动态线程池大小
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_pool_size) as executor:
             future_to_tile = {
-                executor.submit(self.download_tile_worker_with_url, url, path, hdr): (x, y)
-                for (x, y), (url, path, hdr) in zip(tile_coords, tasks)
+                executor.submit(download_with_fallback, x, y, path, urls, hdr): (x, y)
+                for x, y, path, urls, hdr in tasks
             }
+            
+            # 跟踪下载进度
+            completed = 0
             for future in concurrent.futures.as_completed(future_to_tile):
                 tile_coord = future_to_tile[future]
+                completed += 1
                 try:
                     result = future.result()
                     if not result:
                         failed_tiles += 1
-                        print(f"  瓦片 {tile_coord} 下载失败")
+                        print(f"  瓦片 {tile_coord} 最终下载失败")
+                    # 成功的瓦片已经在download_tile_worker_with_url中计数
                 except Exception as e:
                     failed_tiles += 1
                     print(f"  瓦片 {tile_coord} 下载异常: {e}")
+                
+                # 显示进度
+                if completed % 10 == 0 or completed == actual_tiles_to_download:
+                    progress = (completed / actual_tiles_to_download) * 100
+                    print(f"  进度: {completed}/{actual_tiles_to_download} ({progress:.1f}%)")
 
         success_rate = (self.downloaded_count / total_tiles) * 100 if total_tiles > 0 else 0
-        print(f"瓦片下载完成: 成功 {self.downloaded_count}/{total_tiles} ({success_rate:.1f}%)，失败 {failed_tiles} 个")
+        actual_success_rate = (self.downloaded_count - skipped_tiles) / actual_tiles_to_download * 100 if actual_tiles_to_download > 0 else 0
+        
+        print("\n=== 下载完成 ===")
+        print(f"总瓦片数: {total_tiles}")
+        print(f"跳过的瓦片: {skipped_tiles}")
+        print(f"实际下载: {actual_tiles_to_download}")
+        print(f"成功下载: {self.downloaded_count - skipped_tiles}")
+        print(f"失败下载: {failed_tiles}")
+        print(f"总体成功率: {success_rate:.1f}%")
+        print(f"实际下载成功率: {actual_success_rate:.1f}%")
+        print("================")
+        
+        # 打印错误统计
+        self.print_error_stats()
+        
         return self.downloaded_count
     
     def parse_kml_file(self, kml_file_path: str) -> List[Dict]:
