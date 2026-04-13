@@ -112,4 +112,5 @@ WGS84_WKT = CONFIG['coordinate_systems']['wgs84']['wkt']
 # 新增配置项
 PATHS = CONFIG.get('paths', {})
 PROCESSING = CONFIG.get('processing', {})
-WAYBACK_SERVICES = CONFIG.get('wayback_services', {})
+GOOGLE_EARTH_API = CONFIG.get('google_earth_api', {})
+WAYBACK_SERVICES = CONFIG.get('wayback_services', [])

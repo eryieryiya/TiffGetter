@@ -12,19 +12,18 @@ data_source:
   custom_service: ''
   default_data_source: ESRI World Imagery
   history_date: 自动选择
-  wayback_enabled: true
 paths:
-  input_file: D:/CodePool/modular_version/data/input/shp/GanzhouPoints.shp
+  input_file: D:/CodePool/py/TiffGetter/data/input/shp/airLinePoints.shp
   kml_output_subdir: data/output/kml
   output_prefix: square_buffers
   shp_output_subdir: data/output/shp
   temp_tiles_dir: data/output/temp_tiles
-  tiff_output_dir: D:/CodePool/modular_version/data/output/tiff_output4
+  tiff_output_dir: D:/CodePool/py/TiffGetter/data/output/tif/新建文件夹
 processing:
   buffer_sizes:
   - 1000
-  default_zoom: 16
-  download_mode: current
+  default_zoom: 18
+  download_mode: both
   max_zoom: 19
   min_zoom: 1
   request_timeout: 30
@@ -35,18 +34,21 @@ satellite_services:
 - headers:
     Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
     Referer: https://www.arcgis.com/
+  historical_support: wayback
   max_zoom: 18
   name: ESRI World Imagery
   url_template: https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
 - headers:
     Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
     Referer: https://www.google.com/
+  historical_support: google_earth_api
   max_zoom: 20
   name: Google Earth
   url_template: https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}
 - headers:
     Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
     Referer: https://www.bing.com/
+  historical_support: none
   max_zoom: 19
   name: Bing Maps
   url_template: https://t0.tiles.virtualearth.net/tiles/a{q}?g=1
@@ -54,6 +56,7 @@ satellite_services:
     Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
     Referer: https://www.openstreetmap.org/
     User-Agent: Point-to-TIFF-Tool/1.0 (https://github.com/example/point-to-tiff-tool)
+  historical_support: none
   max_zoom: 19
   name: OpenStreetMap
   url_template: https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png
@@ -64,51 +67,143 @@ user_agents:
   Gecko) Chrome/114.0.0.0 Safari/537.36
 - Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0
   Safari/537.36
-- Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)
-  Edge/114.0.18235.88
+- Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/114.0
 - Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like
   Gecko) Version/16.5 Safari/605.1.15
 wayback_services:
-  api:
-    base_url: https://wayback.arcgis.com/arcgis/rest/services
-    time_service: World_Imagery/MapServer
-    wayback_service: World_Imagery/MapServer
-  enabled: true
-  headers:
-    Accept: image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8
-    Referer: https://www.arcgis.com/
-  historical_dates:
-  - date: '2023-01-01'
-    description: 2023年1月的历史影像
-    id: 101
-    name: 2023年影像
-  - date: '2022-01-01'
-    description: 2022年1月的历史影像
-    id: 102
-    name: 2022年影像
-  - date: '2021-01-01'
-    description: 2021年1月的历史影像
-    id: 103
-    name: 2021年影像
-  - date: '2020-01-01'
-    description: 2020年1月的历史影像
-    id: 104
-    name: 2020年影像
-  - date: '2019-01-01'
-    description: 2019年1月的历史影像
-    id: 105
-    name: 2019年影像
-  max_zoom: 18
-  services:
-    current:
-      description: 最新的全球卫星影像
-      name: ESRI World Imagery (Current)
-      url_template: https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}
-    google_earth:
-      description: Google Earth 历史影像
-      name: Google Earth (Historical)
-      url_template: https://mt1.google.com/vt/lyrs=s@1899000000&x={x}&y={y}&z={z}
-    historical:
-      description: 历史全球影像服务
-      name: ESRI World Imagery (Historical)
-      url_template: https://wayback.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?time={time}
+- date: '2025-10-23'
+  id: 20512
+  name: 2025-10-23 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/20512/{z}/{y}/{x}
+- date: '2025-09-25'
+  id: 58924
+  name: 2025-09-25 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/58924/{z}/{y}/{x}
+- date: '2025-09-04'
+  id: 52304
+  name: 2025-09-04 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/52304/{z}/{y}/{x}
+- date: '2025-07-31'
+  id: 49999
+  name: 2025-07-31 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/49999/{z}/{y}/{x}
+- date: '2025-06-26'
+  id: 48925
+  name: 2025-06-26 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/48925/{z}/{y}/{x}
+- date: '2025-05-29'
+  id: 25285
+  name: 2025-05-29 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/25285/{z}/{y}/{x}
+- date: '2025-04-24'
+  id: 27982
+  name: 2025-04-24 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/27982/{z}/{y}/{x}
+- date: '2025-03-27'
+  id: 6543
+  name: 2025-03-27 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/6543/{z}/{y}/{x}
+- date: '2025-02-27'
+  id: 34007
+  name: 2025-02-27 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/34007/{z}/{y}/{x}
+- date: '2025-01-30'
+  id: 36557
+  name: 2025-01-30 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/36557/{z}/{y}/{x}
+- date: '2024-12-12'
+  id: 16453
+  name: 2024-12-12 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/16453/{z}/{y}/{x}
+- date: '2024-11-18'
+  id: 49849
+  name: 2024-11-18 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/49849/{z}/{y}/{x}
+- date: '2024-10-10'
+  id: 56450
+  name: 2024-10-10 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/56450/{z}/{y}/{x}
+- date: '2024-09-19'
+  id: 20337
+  name: 2024-09-19 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/20337/{z}/{y}/{x}
+- date: '2024-08-15'
+  id: 32553
+  name: 2024-08-15 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/32553/{z}/{y}/{x}
+- date: '2024-06-27'
+  id: 39767
+  name: 2024-06-27 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/39767/{z}/{y}/{x}
+- date: '2024-06-06'
+  id: 12428
+  name: 2024-06-06 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/12428/{z}/{y}/{x}
+- date: '2024-05-09'
+  id: 52930
+  name: 2024-05-09 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/52930/{z}/{y}/{x}
+- date: '2024-03-28'
+  id: 13968
+  name: 2024-03-28 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/13968/{z}/{y}/{x}
+- date: '2024-03-07'
+  id: 60013
+  name: 2024-03-07 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/60013/{z}/{y}/{x}
+- date: '2024-02-08'
+  id: 37965
+  name: 2024-02-08 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/37965/{z}/{y}/{x}
+- date: '2024-01-18'
+  id: 41468
+  name: 2024-01-18 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/41468/{z}/{y}/{x}
+- date: '2023-12-07'
+  id: 56102
+  name: 2023-12-07 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/56102/{z}/{y}/{x}
+- date: '2023-11-01'
+  id: 12457
+  name: 2023-11-01 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/12457/{z}/{y}/{x}
+- date: '2023-10-11'
+  id: 1034
+  name: 2023-10-11 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/1034/{z}/{y}/{x}
+- date: '2023-08-31'
+  id: 64776
+  name: 2023-08-31 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/64776/{z}/{y}/{x}
+- date: '2023-08-10'
+  id: 17632
+  name: 2023-08-10 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/17632/{z}/{y}/{x}
+- date: '2023-06-29'
+  id: 47963
+  name: 2023-06-29 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/47963/{z}/{y}/{x}
+- date: '2023-06-13'
+  id: 25982
+  name: 2023-06-13 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/25982/{z}/{y}/{x}
+- date: '2023-05-03'
+  id: 46399
+  name: 2023-05-03 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/46399/{z}/{y}/{x}
+- date: '2023-04-05'
+  id: 37890
+  name: 2023-04-05 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/37890/{z}/{y}/{x}
+- date: '2023-03-15'
+  id: 321
+  name: 2023-03-15 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/321/{z}/{y}/{x}
+- date: '2023-02-23'
+  id: 296
+  name: 2023-02-23 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/296/{z}/{y}/{x}
+- date: '2023-01-27'
+  id: 273
+  name: 2023-01-27 (ESRI Wayback)
+  url_template: https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/273/{z}/{y}/{x}

@@ -693,18 +693,13 @@ class DataSourceConfigPanel(ttk.Frame):
         ttk.Entry(data_source_frame, textvariable=self.custom_service_var, width=60).grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
         ttk.Label(data_source_frame, text="(URL模板，使用{z}/{y}/{x}占位符)").grid(row=1, column=2, sticky=tk.W, pady=5)
         
-        # 启用历史影像
-        ttk.Label(data_source_frame, text="历史影像服务:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.wayback_enabled_var = tk.BooleanVar()
-        ttk.Checkbutton(data_source_frame, text="启用ESRI Wayback历史影像服务", variable=self.wayback_enabled_var).grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
-        
         # 历史影像时间点选择
-        ttk.Label(data_source_frame, text="历史影像时间点:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(data_source_frame, text="历史影像时间点:").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.history_date_var = tk.StringVar(value='自动选择')
-        history_dates = ['自动选择', '2023-01-01', '2022-01-01', '2021-01-01', '2020-01-01', '2019-01-01']
+        history_dates = ['自动选择']
         history_date_combo = ttk.Combobox(data_source_frame, textvariable=self.history_date_var, values=history_dates, width=20)
-        history_date_combo.grid(row=3, column=1, padx=5, pady=5, sticky=tk.W)
-        ttk.Label(data_source_frame, text="(选择特定的历史时间点)").grid(row=3, column=2, sticky=tk.W, pady=5)
+        history_date_combo.grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(data_source_frame, text="(通过Google Earth API自动获取)").grid(row=2, column=2, sticky=tk.W, pady=5)
         
         # 设置初始值
         self.set_config(self.config)
@@ -713,16 +708,12 @@ class DataSourceConfigPanel(ttk.Frame):
         """设置配置"""
         # 设置默认数据源
         data_source_config = config.get('data_source', {})
-        default_data_source = data_source_config.get('default_data_source', 'ESRI World Imagery')
+        default_data_source = data_source_config.get('default_data_source', 'Google Earth')
         self.default_data_source_var.set(default_data_source)
         
         # 设置自定义服务
         custom_service = data_source_config.get('custom_service', '')
         self.custom_service_var.set(custom_service)
-        
-        # 设置历史影像服务
-        wayback_enabled = data_source_config.get('wayback_enabled', False)
-        self.wayback_enabled_var.set(wayback_enabled)
         
         # 设置历史影像时间点
         history_date = data_source_config.get('history_date', '自动选择')
@@ -733,7 +724,6 @@ class DataSourceConfigPanel(ttk.Frame):
         return {
             'default_data_source': self.default_data_source_var.get(),
             'custom_service': self.custom_service_var.get(),
-            'wayback_enabled': self.wayback_enabled_var.get(),
             'history_date': self.history_date_var.get()
         }
 
