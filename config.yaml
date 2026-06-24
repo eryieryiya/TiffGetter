@@ -1,0 +1,20 @@
+# Google Earth 卫星影像工具配置
+
+paths:
+  input_file: data/input/kml/tokyo_landmarks.kml
+  output_prefix: tokyo_buffers
+  shp_output_subdir: data/output/shp
+  kml_output_subdir: data/output/kml
+  tiff_output_dir: data/output/tiff
+  temp_tiles_dir: data/output/temp_tiles
+
+processing:
+  buffer_sizes: [500]
+  thread_pool_size: 10
+  default_zoom: 18
+  max_zoom: 20
+  min_zoom: 1
+  tile_size: 256
+  request_timeout: 30
+  retry_count: 3
+  download_mode: current
