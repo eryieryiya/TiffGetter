@@ -8,6 +8,9 @@ import sys
 import subprocess
 import threading
 import queue
+import signal
+import re
+from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -20,6 +23,7 @@ class App:
         self.root.minsize(620, 460)
         self.process = None
         self.log_queue = queue.Queue()
+        self._stopping = False
 
         # 样式
         style = ttk.Style()
@@ -134,28 +138,80 @@ class App:
         self.log_queue.put(msg)
 
     # ------------------------------------------------------------------
+    def _validate_inputs(self):
+        """入参校验，失败抛 ValueError。"""
+        try:
+            lat = float(self.lat.get())
+        except ValueError:
+            raise ValueError("纬度必须是数字")
+        if not (-90.0 <= lat <= 90.0):
+            raise ValueError(f"纬度越界 {lat}，需 ∈ [-90, 90]")
+
+        try:
+            lon = float(self.lon.get())
+        except ValueError:
+            raise ValueError("经度必须是数字")
+        if not (-180.0 <= lon <= 180.0):
+            raise ValueError(f"经度越界 {lon}，需 ∈ [-180, 180]")
+
+        zoom = self.zoom.get()
+        if not (1 <= zoom <= 20):
+            raise ValueError(f"缩放级别越界 {zoom}，需 ∈ [1, 20]")
+
+        buffer_val = self.buffer_size.get()
+        if not (50 <= buffer_val <= 5000):
+            raise ValueError(f"缓冲区越界 {buffer_val}，需 ∈ [50, 5000]")
+
+        output_dir = self.output.get().strip()
+        if not output_dir:
+            raise ValueError("输出目录不能为空")
+        # 校验输出目录可创建
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            raise ValueError(f"输出目录无法创建：{e}")
+
+        ds = self.date_start.get().strip()
+        de = self.date_end.get().strip()
+        if ds and de:
+            for d in (ds, de):
+                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+                    raise ValueError(f"日期格式错误 '{d}'，应为 YYYY-MM-DD")
+            if ds > de:
+                raise ValueError("起始日期不能晚于截止日期")
+        elif ds or de:
+            raise ValueError("起始和截止日期必须同时填写或同时留空")
+
+        return lat, lon
+
+    # ------------------------------------------------------------------
     def start(self):
         try:
-            lat, lon = float(self.lat.get()), float(self.lon.get())
-        except ValueError:
-            messagebox.showerror("错误", "请输入有效的经纬度")
+            lat, lon = self._validate_inputs()
+        except ValueError as e:
+            messagebox.showerror("输入错误", str(e))
             return
 
         zoom = self.zoom.get()
         buffer_val = self.buffer_size.get()
-        output_dir = self.output.get()
+        output_dir = self.output.get().strip()
         ds = self.date_start.get().strip()
         de = self.date_end.get().strip()
 
+        self._stopping = False
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.log.delete(1.0, tk.END)
         self.status_var.set("运行中...")
 
         def done():
+            # 由后台线程在子进程退出后接管按钮状态
             self.start_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
-            self.status_var.set("完成")
+            if self._stopping:
+                self.status_var.set("已停止")
+            else:
+                self.status_var.set("完成")
 
         def run():
             main_py = os.path.join(BASE_DIR, "main.py")
@@ -167,10 +223,17 @@ class App:
             if ds and de:
                 cmd.extend(["--date-range", ds, de])
 
+            # Windows 下用 CREATE_NEW_PROCESS_GROUP 才能发 CTRL_BREAK_EVENT
+            creationflags = 0
+            if os.name == 'nt':
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
             try:
                 self.process = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, cwd=BASE_DIR)
+                    text=True, cwd=BASE_DIR,
+                    creationflags=creationflags
+                )
                 for line in self.process.stdout:
                     self.log_msg(line.rstrip())
                 self.process.wait()
@@ -183,11 +246,29 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def stop(self):
-        if self.process:
-            self.process.terminate()
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.status_var.set("已停止")
+        """发送停止信号，中间态显示'正在停止…'，按钮状态由 done() 接管。"""
+        if self.process and self.process.poll() is None:
+            self._stopping = True
+            self.status_var.set("正在停止…")
+            self.stop_btn.config(state=tk.DISABLED)
+            try:
+                if os.name == 'nt':
+                    # Windows：发送 CTRL_BREAK_EVENT（需要 CREATE_NEW_PROCESS_GROUP）
+                    self.process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    self.process.terminate()
+            except Exception as e:
+                self.log_msg(f"停止信号发送失败: {e}")
+                # 退路：terminate
+                try:
+                    self.process.terminate()
+                except Exception:
+                    pass
+        else:
+            # 进程已结束，直接复位
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            self.status_var.set("已停止")
 
 
 if __name__ == "__main__":
