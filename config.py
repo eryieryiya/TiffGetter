@@ -1,4 +1,4 @@
-# 配置模块 - Google Earth 专用配置
+# 配置模块 - ESRI Wayback 卫星影像工具配置
 import os
 
 try:
@@ -9,7 +9,7 @@ except ImportError:
 
 DEFAULT_CONFIG = {
     'processing': {
-        'thread_pool_size': 50,
+        'thread_pool_size': 10,
         'request_timeout': 30,
         'retry_count': 3,
         'default_zoom': 18,

@@ -36,3 +36,6 @@ temp_tiles*/
 # OS
 Thumbs.db
 .DS_Store
+
+# TRAE
+.trae/
