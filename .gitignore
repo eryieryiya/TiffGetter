@@ -8,10 +8,20 @@ build/
 dist/
 *.egg-info/
 
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
 # Virtual Environment
 venv/
 .venv/
 ENV/
+
+# Conda / mamba
+*.conda
+*.tar.bz2
 
 # IDE
 .vscode/
@@ -27,7 +37,7 @@ data/input/kml/
 logs/
 *.log
 
-# Temporary tiles
+# Temporary tiles (download_image 工作目录）
 temp_tiles*/
 
 # Jupyter
@@ -35,7 +45,27 @@ temp_tiles*/
 
 # OS
 Thumbs.db
+.DESKTOP
 .DS_Store
 
-# TRAE
+# TRAE / AI IDE
 .trae/
+.cursor/
+.agents/
+
+# 历史旧计划目录（与 docs/plans 重复，保留后者即可）
+docs/superpowers/
+
+# 通用临时/备份文件
+*.bak
+*.tmp
+*.old
+*.orig
+*_BACKUP_*
+
+# 本地运行产物
+core
+*.core
+
+# 所有测试文件（单元/集成/探针 —— 一律不入库，用户明确要求）
+tests/
