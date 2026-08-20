@@ -1,12 +1,11 @@
-# Google Earth 卫星影像工具配置
+# ESRI Wayback 卫星影像工具配置
 
 paths:
-  input_file: data/input/kml/tokyo_landmarks.kml
-  output_prefix: tokyo_buffers
-  shp_output_subdir: data/output/shp
-  kml_output_subdir: data/output/kml
-  tiff_output_dir: data/output/tiff
-  temp_tiles_dir: data/output/temp_tiles
+  # 默认输出子目录名（用于 data/output/<subdir>/<coord>/<date>/）
+  output_subdir: historical
+  # GUI 启动时的默认坐标
+  default_lat: 35.6586
+  default_lon: 139.7454
 
 processing:
   buffer_sizes: [500]
@@ -17,4 +16,4 @@ processing:
   tile_size: 256
   request_timeout: 30
   retry_count: 3
-  download_mode: current
+  download_mode: historical
