@@ -183,6 +183,66 @@ conda activate satellite-image-processing
 pip install requests pillow numpy rasterio pyyaml psutil pyshp pyproj ttkbootstrap tkintermapview
 ```
 
+## 打包为独立 exe
+
+将项目打包为独立的 Windows 可执行文件，无需安装 Python 环境即可运行。
+
+### 一键打包
+
+```powershell
+.\build_exe.ps1
+```
+
+脚本会自动：
+- 探测可用的 Python 环境（优先使用 Anaconda base）
+- 安装缺失的依赖（pyinstaller、tkcalendar）
+- 执行 PyInstaller 打包
+- 验证产物（CLI --help、GUI 启动冒烟、归档内容检查）
+
+### 产物
+
+```
+dist/TiffGetter.exe    # 约 83 MB，onefile 单文件
+```
+
+### 使用方式
+
+- **GUI 模式**：双击 `TiffGetter.exe`
+- **CLI 模式**：`TiffGetter.exe --lat 35.6586 --lon 139.7454`
+
+### 构建环境要求
+
+- Python 3.10+（推荐 3.12）
+- PyInstaller 6.x
+- 所有项目依赖（见 `environment.yml`）
+
+### 已知问题与解决方案
+
+打包过程中可能遇到的问题及解决方案已内置到 `TiffGetter.spec` 中：
+
+1. **Tcl/Tk DLL 版本冲突**：多 conda 环境 PATH 污染时，PyInstaller 可能从错误的环境收集 tcl86t.dll。spec 中的 `_normalize_tcl_binaries()` 函数会自动修正。
+
+2. **ttkbootstrap 资源缺失**：ttkbootstrap 无官方 PyInstaller hook，spec 中通过 `collect_data_files('ttkbootstrap')` 手动收集主题资源。
+
+3. **rasterio 子模块缺失**：PyInstaller 静态分析无法发现 rasterio 的动态导入子模块，spec 中通过 `hiddenimports` 显式声明所有子模块。
+
+4. **tkcalendar 与主题切换兼容性**：DateEntry 组件不使用 `bootstyle` 参数，避免 Calendar 内部对象缺少 `.style` 属性导致的 AttributeError。
+
+### 手动打包
+
+如需自定义打包参数：
+
+```powershell
+# 使用指定的 Python 环境
+.\build_exe.ps1 -Python D:\Python312\python.exe
+
+# 跳过自动安装依赖
+.\build_exe.ps1 -NoInstallDeps
+
+# 跳过打包后验证
+.\build_exe.ps1 -SkipVerify
+```
+
 ## 旧版本残余清理
 
 启动时 `WaybackImageFetcher.__init__` 会自动清理根目录下所有 `temp_tiles_*` 目录。
