@@ -49,6 +49,29 @@ from utils.cleanup import scan_residuals, cleanup_temp_tiles, delete_paths, form
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _build_cli_cmd(extra_args: List[str]) -> List[str]:
+    """构造 CLI 子进程命令（下载逻辑跑在子进程，stdout 回传日志面板）。
+
+    开发态: python main.py <args>
+    打包态: TiffGetter.exe <args>（app_entry 自动按参数路由到 CLI；
+            sys.executable 即 exe 自身，不再拼接脚本路径）
+    """
+    if getattr(sys, 'frozen', False):
+        return [sys.executable] + list(extra_args)
+    return [sys.executable, os.path.join(BASE_DIR, 'main.py')] + list(extra_args)
+
+
+def _cli_workdir() -> str:
+    """CLI 子进程的工作目录。
+
+    打包态下 BASE_DIR 是 PyInstaller 临时解压目录（退出即删除），
+    相对输出路径会写进临时目录导致数据丢失；改为 exe 所在目录。
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return BASE_DIR
+
 # ----------------------------------------------------------------------
 # 主题系统常量
 # ----------------------------------------------------------------------
@@ -182,12 +205,43 @@ class App:
         full = self._current_full_theme()
         try:
             self.root.withdraw()
-            self.style = tb.Style(theme=full)
+            # 使用 theme_use() 而不是 tb.Style(theme=full)，避免遍历所有 widget
+            # 这样可以避免 tkcalendar 的 Calendar 组件兼容性问题
+            self.style.theme_use(full)
             self._last_good_theme = full
             self._recolor_widgets_for_theme()
             self._tp_save({"theme_pair": self.theme_pair, "mode": self.theme_mode})
             self._update_statusbar_theme_label()
             self.root.deiconify()
+        except AttributeError as e:
+            # tkcalendar 的 Calendar 组件与 ttkbootstrap 主题切换存在兼容性问题
+            # Calendar 对象没有 .style 属性，导致 AttributeError
+            # 但 theme_use() 已经成功设置了主题，只是某些 widget 的样式没有更新
+            # 我们忽略这个错误，认为主题切换成功
+            if "Calendar" in str(e) and "style" in str(e):
+                self._last_good_theme = full
+                # 用 try-except 包裹，避免再次触发 Calendar 错误
+                try:
+                    self._recolor_widgets_for_theme()
+                except Exception:
+                    pass
+                self._tp_save({"theme_pair": self.theme_pair, "mode": self.theme_mode})
+                self._update_statusbar_theme_label()
+                try:
+                    self.root.deiconify()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.root.deiconify()
+                except Exception:
+                    pass
+                self.log_msg(f"[theme] 切换失败 {full}: {e}")
+                if self._last_good_theme and HAS_TTKBOOTSTRAP:
+                    try:
+                        self.style.theme_use(self._last_good_theme)
+                    except Exception:
+                        pass
         except Exception as e:
             try:
                 self.root.deiconify()
@@ -196,9 +250,27 @@ class App:
             self.log_msg(f"[theme] 切换失败 {full}: {e}")
             if self._last_good_theme and HAS_TTKBOOTSTRAP:
                 try:
-                    self.style = tb.Style(theme=self._last_good_theme)
+                    self.style.theme_use(self._last_good_theme)
                 except Exception:
                     pass
+    
+    def _find_all_date_entries(self) -> list:
+        """递归查找所有 DateEntry 组件"""
+        date_entries = []
+        
+        def _find_recursive(widget):
+            try:
+                # 检查是否是 DateEntry（通过类名判断）
+                if widget.__class__.__name__ == 'DateEntry':
+                    date_entries.append(widget)
+                # 递归检查子组件
+                for child in widget.winfo_children():
+                    _find_recursive(child)
+            except Exception:
+                pass
+        
+        _find_recursive(self.root)
+        return date_entries
 
     def _recolor_widgets_for_theme(self) -> None:
         colors = self._get_theme_colors(self._last_good_theme or "")
@@ -477,12 +549,8 @@ class App:
     def _date_entry(self, parent, variable: tk.StringVar):
         try:
             from tkcalendar import DateEntry  # type: ignore
-            if HAS_TTKBOOTSTRAP:
-                try:
-                    return DateEntry(parent, textvariable=variable,
-                                     date_pattern='y-mm-dd', bootstyle=PRIMARY, width=22)
-                except Exception:
-                    pass
+            # 不使用 bootstyle 参数，避免 tkcalendar 的 Calendar 组件与 ttkbootstrap
+            # 主题切换产生兼容性问题（Calendar object has no attribute style）
             return DateEntry(parent, textvariable=variable,
                              date_pattern='y-mm-dd', width=22)
         except ImportError:
@@ -1326,10 +1394,9 @@ class App:
         self.log.delete(1.0, tk.END)
         self.status_var.set("运行中...")
 
-        cmd = [sys.executable, os.path.join(BASE_DIR, "main.py"),
-               "--lat", str(lat), "--lon", str(lon),
-               "--zoom", str(zoom), "--buffer", str(buf),
-               "--output", out]
+        cmd = _build_cli_cmd(["--lat", str(lat), "--lon", str(lon),
+                              "--zoom", str(zoom), "--buffer", str(buf),
+                              "--output", out])
         if ds and de:
             cmd.extend(["--date-range", ds, de])
 
@@ -1348,11 +1415,10 @@ class App:
         self.log.delete(1.0, tk.END)
         self.status_var.set("批量下载中...")
 
-        cmd = [sys.executable, os.path.join(BASE_DIR, "main.py"),
-               "--coords-file", path,
-               "--zoom", str(zoom), "--buffer", str(buf),
-               "--output", out,
-               "--coord-concurrency", str(conc)]
+        cmd = _build_cli_cmd(["--coords-file", path,
+                              "--zoom", str(zoom), "--buffer", str(buf),
+                              "--output", out,
+                              "--coord-concurrency", str(conc)])
         if ds and de:
             cmd.extend(["--date-range", ds, de])
 
@@ -1366,7 +1432,7 @@ class App:
             try:
                 self.process = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, cwd=BASE_DIR,
+                    text=True, cwd=_cli_workdir(),
                     creationflags=creationflags,
                 )
                 for line in self.process.stdout:

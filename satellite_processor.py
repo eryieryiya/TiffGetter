@@ -23,7 +23,12 @@ try:
     import rasterio  # noqa: F401
     from rasterio.transform import from_bounds
     _RASTERIO_AVAILABLE = True
-except ImportError:
+except Exception as _ra:
+    # 记录真实失败原因（打包态常见：DLL 缺失 / 数据文件路径问题），
+    # 避免只留下"请安装 rasterio"的猜测性提示
+    import traceback as _tb
+    _tb.print_exc()
+    print(f"[rasterio 导入失败] {type(_ra).__name__}: {_ra}")
     rasterio = None
     from_bounds = None
 
@@ -887,7 +892,7 @@ class WaybackImageFetcher:
         tif_path = os.path.join(date_dir, f"{date_str}.tif")
 
         if self.png_to_geotiff(temp_png_path, tif_path, bounds):
-            # 复制 PNG 到输出目录
+            # GeoTIFF 成功，复制 PNG 到输出目录
             with open(temp_png_path, 'rb') as src:
                 with open(png_path, 'wb') as dst:
                     dst.write(src.read())
@@ -907,9 +912,28 @@ class WaybackImageFetcher:
                 'date': date_str,
                 'path': tif_path
             }
-
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        return None
+        else:
+            # GeoTIFF 失败（rasterio 不可用），降级为仅输出 PNG
+            logger.warning(f"GeoTIFF 转换失败，降级为仅输出 PNG: {date_str}")
+            with open(temp_png_path, 'rb') as src:
+                with open(png_path, 'wb') as dst:
+                    dst.write(src.read())
+            if img_md5:
+                self._downloaded_hashes.add(img_md5)
+            if img_dhash is not None:
+                self._downloaded_dhashes.add(img_dhash)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info(
+                f"成功（仅 PNG）: {png_path} "
+                f"[最终覆盖 {out_ew_m:.0f}m(EW) × {out_ns_m:.0f}m(NS)]"
+            )
+            return {
+                'status': 'success',
+                'hash': img_md5,
+                'dhash': img_dhash,
+                'date': date_str,
+                'path': png_path
+            }
 
     # ------------------------------------------------------------------
     # 批量入口
