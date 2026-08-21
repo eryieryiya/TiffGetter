@@ -78,6 +78,17 @@ if (-not (Test-Module $py 'rasterio')) {
           "建议改用已验证的 conda base: -Python $CondaBase"
 }
 
+# Pillow 必须可导入（spec 启动时从 icon/main_v2.png 生成 .ico）
+Install-IfMissing $py 'Pillow'
+
+# 应用图标源文件存在性提示
+$iconSrc = Join-Path $Root 'icon\main_v2.png'
+if (Test-Path $iconSrc) {
+    Write-Host "[*] 应用图标: $iconSrc -> icon\main_v2.ico（spec 内自动生成多尺寸 ICO）" -ForegroundColor Cyan
+} else {
+    Write-Host '[!] 未找到 icon\main_v2.png，将使用默认图标' -ForegroundColor Yellow
+}
+
 $pyVer = & $py -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
 $riVer = & $py -c "import rasterio; print(rasterio.__version__)"
 Write-Host "[*] Python $pyVer + rasterio $riVer + PyInstaller $(& $py -m PyInstaller --version)"
@@ -85,6 +96,14 @@ Write-Host "[*] Python $pyVer + rasterio $riVer + PyInstaller $(& $py -m PyInsta
 # ---- 3. 打包 ----
 Write-Host ''
 Write-Host '[*] 开始打包（onefile，约需 2-5 分钟）...' -ForegroundColor Cyan
+
+# spec 会从 icon/main_v2.png 自动生成 icon/main_v2.ico，先清掉旧的避免误用
+$staleIco = Join-Path $Root 'icon\main_v2.ico'
+if (Test-Path $staleIco) {
+    Remove-Item $staleIco -Force
+    Write-Host '[*] 已清理旧 icon\main_v2.ico，spec 将重新生成' -ForegroundColor DarkGray
+}
+
 & $py -m PyInstaller --noconfirm --clean --log-level WARN TiffGetter.spec
 if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 打包失败' }
 
@@ -147,4 +166,8 @@ Write-Host ''
 Write-Host '=' * 62 -ForegroundColor DarkCyan
 Write-Host " 打包完成: $exe ($sizeMb MB)" -ForegroundColor Green
 Write-Host ' 使用: 双击运行 GUI；命令行模式见 --help' -ForegroundColor DarkCyan
+$iconOut = Join-Path $Root 'icon\main_v2.ico'
+if (Test-Path $iconOut) {
+    Write-Host " 应用图标: $iconOut（已嵌入 exe）" -ForegroundColor DarkCyan
+}
 Write-Host '=' * 62 -ForegroundColor DarkCyan

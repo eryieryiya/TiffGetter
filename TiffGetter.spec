@@ -75,11 +75,27 @@ excludes = [
 ]
 
 # ---------------------------------------------------------------------------
-# 图标（存在 icon.ico 时启用）
+# 图标：自动从 icon/main_v2.png 生成 icon/main_v2.ico（多尺寸 16/32/48/64/128/256）
 # ---------------------------------------------------------------------------
-icon_path = os.path.join(project_root, 'icon.ico')
-if not os.path.exists(icon_path):
-    icon_path = None
+icon_png = os.path.join(project_root, 'icon', 'main_v2.png')
+icon_path = None
+if os.path.exists(icon_png):
+    try:
+        from PIL import Image
+        ico_path = os.path.join(project_root, 'icon', 'main_v2.ico')
+        img = Image.open(icon_png)
+        # ICO 内嵌多尺寸（Windows 资源管理器/任务栏/快捷方式分别使用）
+        ico_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+        # 仅保留源图能覆盖的尺寸（避免 PIL 上采样模糊）
+        sizes = [s for s in ico_sizes if min(img.size) >= s[0]]
+        img.save(ico_path, format='ICO', sizes=sizes)
+        icon_path = ico_path
+        print(f'[*] 已从 {icon_png} 生成 ICO: {ico_path}（尺寸 {sizes}）')
+    except Exception as e:
+        print(f'[!] 图标生成失败（将使用默认图标）: {e}')
+        icon_path = None
+else:
+    print('[!] 未找到 icon/main_v2.png，使用默认图标')
 
 # ---------------------------------------------------------------------------
 # 隐式导入（PyInstaller 静态分析无法发现的模块）

@@ -72,3 +72,6 @@ tests/
 
 # omo
 .omo/
+
+# 打包时自动生成的 ICO（spec 从 PNG 重新生成，不入库）
+icon/*.ico
