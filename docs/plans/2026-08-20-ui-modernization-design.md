@@ -5,9 +5,9 @@
 - 默认主题：Tokyo Night（暗/亮配对），支持持久化切换
 - 日期控件：tkcalendar 可选依赖（缺失降级为 Entry + placeholder）
 
-## 1. 架构不变性（测试零风险保证）
+## 1. 架构不变性
 
-下列契约**完全保留**，不修改已有 96 个测试的任何代码：
+下列契约保留，不破坏现有调用方代码：
 
 - 子进程启动方式：`python main.py <args>` 通过 `subprocess.Popen(stdout=PIPE, stderr=STDOUT)` 读取行流
 - 日志行解析正则：`[i/N]` 进度、`[OK]`/`[FAIL]`/`[PART]` 结果行语义
@@ -211,4 +211,4 @@ def pref_path() -> str: ...            # Windows: %APPDATA%/TiffGetter/theme_pre
 | `environment.yml` | 修改（追加 tkcalendar 可选行注释） | ~+1 |
 | `tests/test_unit_theme_pref.py` | 新增（可选） | ~60 |
 
-> 不修改：`main.py` / `satellite_processor.py` / `coordinate_loader.py` / `utils/cleanup.py` / 现有 96 个测试文件。
+> 不修改：`main.py` / `satellite_processor.py` / `coordinate_loader.py` / `utils/cleanup.py` 四个核心模块的公共 API。

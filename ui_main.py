@@ -31,7 +31,6 @@ try:
 except ImportError:
     # 回退到原生 ttk
     HAS_TTKBOOTSTRAP = False
-    from tkinter import ttk
     # 提供空常量占位
     PRIMARY = SUCCESS = INFO = WARNING = DANGER = SECONDARY = None
 
@@ -86,6 +85,7 @@ THEME_PAIRS: Dict[str, tuple] = {
     "minty":       ("minty-dark",       "minty-light"),
 }
 DEFAULT_PAIR_KEY = "tokyo-night"
+DATE_PLACEHOLDER = "YYYY-MM-DD"
 
 # 48x48 卫星剪影图标 base64
 _ICON_B64 = (
@@ -253,24 +253,6 @@ class App:
                     self.style.theme_use(self._last_good_theme)
                 except Exception:
                     pass
-    
-    def _find_all_date_entries(self) -> list:
-        """递归查找所有 DateEntry 组件"""
-        date_entries = []
-        
-        def _find_recursive(widget):
-            try:
-                # 检查是否是 DateEntry（通过类名判断）
-                if widget.__class__.__name__ == 'DateEntry':
-                    date_entries.append(widget)
-                # 递归检查子组件
-                for child in widget.winfo_children():
-                    _find_recursive(child)
-            except Exception:
-                pass
-        
-        _find_recursive(self.root)
-        return date_entries
 
     def _recolor_widgets_for_theme(self) -> None:
         colors = self._get_theme_colors(self._last_good_theme or "")
@@ -318,54 +300,51 @@ class App:
     # ------------------------------------------------------------------
     # UI 构造
     # ------------------------------------------------------------------
-    def _btn(self, parent, text, command=None, style=None, **kw):
-        """统一构造按钮：ttkbootstrap 时使用 bootstyle，否则只用原生 ttk。"""
-        # ttkbootstrap 专属参数 → 原生 ttk 不支持时剥离
-        tb_only = {"ipad", "ipady", "ipadx"}
-        safe_kw = {k: v for k, v in kw.items() if k not in tb_only}
+    # ttkbootstrap 专属关键字集合；原生 ttk 不支持时被剥离
+    _TB_ONLY_KEYS = {"bootstyle", "ipad", "ipady", "ipadx"}
+
+    def _tk(self, kind, parent, *, tb_cls, ttk_cls, style=None, extra=None, **kw):
+        """统一构造 ttkbootstrap / 原生 ttk 控件；ttkbootstrap 失败时回退到 ttk。
+
+        kind: 当前未使用，保留扩展位
+        tb_cls / ttk_cls: ttkbootstrap 与原生 ttk 控件类
+        style: bootstyle 名
+        extra: 仅传给 ttkbootstrap 的额外参数（如 Checkbutton 的 variable）
+        """
         if HAS_TTKBOOTSTRAP:
-            kw2 = {"bootstyle": style} if style else {}
+            bs_kw = {"bootstyle": style} if style else {}
             try:
-                return tb.Button(parent, text=text, command=command, **kw2, **kw)
+                if extra:
+                    return tb_cls(parent, **bs_kw, **extra, **kw)
+                return tb_cls(parent, **bs_kw, **kw)
             except Exception:
                 pass
-        return ttk.Button(parent, text=text, command=command, **safe_kw)
+        # 回退到原生 ttk：剥离 ttkbootstrap 专属参数
+        safe_kw = {k: v for k, v in kw.items() if k not in self._TB_ONLY_KEYS}
+        if extra:
+            safe_extra = {k: v for k, v in extra.items() if k not in self._TB_ONLY_KEYS}
+            return ttk_cls(parent, **safe_extra, **safe_kw)
+        return ttk_cls(parent, **safe_kw)
+
+    def _btn(self, parent, text, command=None, style=None, **kw):
+        """统一构造按钮。"""
+        return self._tk("btn", parent, tb_cls=tb.Button, ttk_cls=ttk.Button,
+                        style=style, extra={"text": text, "command": command}, **kw)
 
     def _lbl(self, parent, text="", style=None, **kw):
-        """统一构造标签：tb.Label 失败时回退到 ttk.Label。"""
-        tb_only = {"bootstyle"}
-        safe_kw = {k: v for k, v in kw.items() if k not in tb_only}
-        if HAS_TTKBOOTSTRAP:
-            kw2 = {"bootstyle": style} if style else {}
-            try:
-                return tb.Label(parent, text=text, **kw2, **kw)
-            except Exception:
-                pass
-        return ttk.Label(parent, text=text, **safe_kw)
+        """统一构造标签。"""
+        return self._tk("lbl", parent, tb_cls=tb.Label, ttk_cls=ttk.Label,
+                        style=style, extra={"text": text}, **kw)
 
     def _cb(self, parent, text="", variable=None, style=None, **kw):
-        """统一构造复选框：tb.Checkbutton 失败时回退到 ttk.Checkbutton。"""
-        tb_only = {"bootstyle"}
-        safe_kw = {k: v for k, v in kw.items() if k not in tb_only}
-        if HAS_TTKBOOTSTRAP:
-            kw2 = {"bootstyle": style} if style else {}
-            try:
-                return tb.Checkbutton(parent, text=text, variable=variable, **kw2, **kw)
-            except Exception:
-                pass
-        return ttk.Checkbutton(parent, text=text, variable=variable, **safe_kw)
+        """统一构造复选框。"""
+        return self._tk("cb", parent, tb_cls=tb.Checkbutton, ttk_cls=ttk.Checkbutton,
+                        style=style, extra={"text": text, "variable": variable}, **kw)
 
     def _pb(self, parent, style=None, **kw):
-        """统一构造进度条：tb.Progressbar 失败时回退到 ttk.Progressbar。"""
-        tb_only = {"bootstyle"}
-        safe_kw = {k: v for k, v in kw.items() if k not in tb_only}
-        if HAS_TTKBOOTSTRAP:
-            kw2 = {"bootstyle": style} if style else {}
-            try:
-                return tb.Progressbar(parent, **kw2, **kw)
-            except Exception:
-                pass
-        return ttk.Progressbar(parent, **safe_kw)
+        """统一构造进度条。"""
+        return self._tk("pb", parent, tb_cls=tb.Progressbar, ttk_cls=ttk.Progressbar,
+                        style=style, **kw)
 
     def _build_ui(self):
         # ---------- 品牌头部 ----------
@@ -554,18 +533,17 @@ class App:
             return DateEntry(parent, textvariable=variable,
                              date_pattern='y-mm-dd', width=22)
         except ImportError:
-            PLACEHOLDER = "YYYY-MM-DD"
             e = ttk.Entry(parent, textvariable=variable, width=22)
             colors = self._get_theme_colors(self._last_good_theme or "")
             ph = colors.get("ph_fg", "#888")
             normal_fg = colors.get("log_fg", "#000")
 
-            def on_focus_in(_ev, e=e, ph=PLACEHOLDER, nfg=normal_fg):
+            def on_focus_in(_ev, e=e, ph=DATE_PLACEHOLDER, nfg=normal_fg):
                 if e.get() == ph:
                     e.delete(0, tk.END)
                     e.configure(foreground=nfg)
 
-            def on_focus_out(_ev, e=e, ph=PLACEHOLDER, phfg=ph):
+            def on_focus_out(_ev, e=e, ph=DATE_PLACEHOLDER, phfg=ph):
                 if not e.get().strip():
                     e.insert(0, ph)
                     e.configure(foreground=phfg)
@@ -575,7 +553,7 @@ class App:
             e.bind('<FocusIn>', on_focus_in)
             e.bind('<FocusOut>', on_focus_out)
             if not variable.get():
-                e.insert(0, PLACEHOLDER)
+                e.insert(0, DATE_PLACEHOLDER)
                 e.configure(foreground=ph)
             return e
 
@@ -920,8 +898,6 @@ class App:
             sel = self.log.selection_get()
             self.root.clipboard_clear()
             self.root.clipboard_append(sel)
-        except tk.TclError:
-            pass
         except Exception:
             pass
 
@@ -1054,6 +1030,18 @@ class App:
     # ------------------------------------------------------------------
     # Tab 2 操作
     # ------------------------------------------------------------------
+    def _open_in_file_manager(self, path: str):
+        """跨平台打开文件管理器并定位到 path。静默失败。"""
+        try:
+            if os.name == 'nt':
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except Exception as e:
+            self.log_msg(f"打开目录失败: {e}")
+
     def _export_coord_template(self):
         """导出 CSV 模板到临时目录并打开所在文件夹。静默失败。"""
         try:
@@ -1069,21 +1057,7 @@ class App:
             ]
             with open(path, 'w', encoding='utf-8-sig', newline='') as f:
                 f.write("\n".join(lines) + "\n")
-            if os.name == 'nt':
-                try:
-                    os.startfile(target_dir)
-                except Exception:
-                    pass
-            elif sys.platform == 'darwin':
-                try:
-                    subprocess.Popen(['open', target_dir])
-                except Exception:
-                    pass
-            else:
-                try:
-                    subprocess.Popen(['xdg-open', target_dir])
-                except Exception:
-                    pass
+            self._open_in_file_manager(target_dir)
             self.log_msg(f"已导出坐标模板：{path}")
         except Exception as e:
             self.log_msg(f"导出模板失败: {e}")
@@ -1293,6 +1267,24 @@ class App:
             self.start_batch_btn.config(state=tk.NORMAL)
             self.stop_btn.config(state=tk.DISABLED)
 
+    def _validate_date_range(self, start_var: tk.StringVar, end_var: tk.StringVar):
+        """校验日期范围：占位符视为空，需同时填写或同时留空。返回 (ds, de)。"""
+        ds = start_var.get().strip()
+        de = end_var.get().strip()
+        if ds == DATE_PLACEHOLDER:
+            ds = ""
+        if de == DATE_PLACEHOLDER:
+            de = ""
+        if ds or de:
+            for d in (ds, de):
+                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
+                    raise ValueError(f"日期格式错误 '{d}'")
+            if ds and de and ds > de:
+                raise ValueError("起始日期不能晚于截止日期")
+            if not (ds and de):
+                raise ValueError("起始和截止日期必须同时填写或同时留空")
+        return ds, de
+
     def _validate_inputs_single(self):
         try:
             lat = float(self.lat_var.get())
@@ -1319,22 +1311,7 @@ class App:
             os.makedirs(out, exist_ok=True)
         except OSError as e:
             raise ValueError(f"输出目录无法创建：{e}")
-        _PLACEHOLDER = "YYYY-MM-DD"
-        ds = self.date_start_var.get().strip()
-        de = self.date_end_var.get().strip()
-        # 占位符视为空
-        if ds == _PLACEHOLDER:
-            ds = ""
-        if de == _PLACEHOLDER:
-            de = ""
-        if ds or de:
-            for d in (ds, de):
-                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
-                    raise ValueError(f"日期格式错误 '{d}'")
-            if ds and de and ds > de:
-                raise ValueError("起始日期不能晚于截止日期")
-            if not (ds and de):
-                raise ValueError("起始和截止日期必须同时填写或同时留空")
+        ds, de = self._validate_date_range(self.date_start_var, self.date_end_var)
         return lat, lon, zoom, buf, out, ds, de
 
     def _validate_inputs_batch(self):
@@ -1356,21 +1333,7 @@ class App:
             os.makedirs(out, exist_ok=True)
         except OSError as e:
             raise ValueError(f"输出目录无法创建：{e}")
-        _PLACEHOLDER = "YYYY-MM-DD"
-        ds = self.batch_date_start_var.get().strip()
-        de = self.batch_date_end_var.get().strip()
-        if ds == _PLACEHOLDER:
-            ds = ""
-        if de == _PLACEHOLDER:
-            de = ""
-        if ds or de:
-            for d in (ds, de):
-                if not re.match(r'^\d{4}-\d{2}-\d{2}$', d):
-                    raise ValueError(f"日期格式错误 '{d}'")
-            if ds and de and ds > de:
-                raise ValueError("起始日期不能晚于截止日期")
-            if not (ds and de):
-                raise ValueError("起始和截止日期必须同时填写或同时留空")
+        ds, de = self._validate_date_range(self.batch_date_start_var, self.batch_date_end_var)
         conc = self.batch_concurrency_var.get()
         if not (1 <= conc <= 16):
             raise ValueError(f"并发数越界 {conc}")
@@ -1477,14 +1440,11 @@ class App:
             except Exception:
                 pass
             # 进度条 bootstyle 切回 SUCCESS
-            try:
-                if HAS_TTKBOOTSTRAP and self.progress and hasattr(self.progress, 'configure'):
-                    try:
-                        self.progress.configure(bootstyle=f"{SUCCESS}-striped")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            if HAS_TTKBOOTSTRAP:
+                try:
+                    self.progress.configure(bootstyle=f"{SUCCESS}-striped")
+                except Exception:
+                    pass
 
     def _open_selected_path(self, _event):
         iid = self.result_tree.focus()
@@ -1494,15 +1454,7 @@ class App:
         path = vals[2] if len(vals) > 2 else ''
         # 路径可能只是 "lat,lon 成功 X/Y"，无目录则忽略
         if path and os.path.exists(path):
-            try:
-                if os.name == 'nt':
-                    os.startfile(os.path.dirname(path))
-                elif sys.platform == 'darwin':
-                    subprocess.Popen(['open', os.path.dirname(path)])
-                else:
-                    subprocess.Popen(['xdg-open', os.path.dirname(path)])
-            except Exception as e:
-                self.log_msg(f"打开目录失败: {e}")
+            self._open_in_file_manager(os.path.dirname(path))
 
 
 def main():
