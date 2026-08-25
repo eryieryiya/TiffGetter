@@ -13,7 +13,6 @@ dependencies:
     - pillow      # PIL（瓦片拼合、图像预处理）
     - numpy       # 数值计算（矩阵、图像数组）
     - rasterio    # TIFF 写入与栅格处理（延迟导入，缺省时自动降级为仅保存 PNG）
-    - pyyaml      # YAML 读写（未来若用配置文件可立即启用）
     - psutil      # 进程监控（CPU/内存使用、后台进程管理）
 
     # ---- UI 现代化（依赖缺失时程序仍可运行，仅降级为原生 ttk） ----

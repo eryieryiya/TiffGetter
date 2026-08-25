@@ -3,7 +3,7 @@
 
 生成: dist/TiffGetter.exe
 入口: app_entry.py（无参数 → GUI；带参数 → CLI）
-数据: config.yaml + GDAL 数据目录 + rasterio 自带 proj/gdal 数据
+数据: GDAL 数据目录 + rasterio 自带 proj/gdal 数据
 """
 import os
 import sys
@@ -17,10 +17,7 @@ project_root = os.path.abspath(SPECPATH)  # spec 所在目录 = 项目根目录
 # ---------------------------------------------------------------------------
 datas = []
 
-# 1) 运行时配置（config.py 按 __file__ 相对定位，onefile 解压目录为 _MEIPASS）
-datas.append(('config.yaml', '.'))
-
-# 2) GDAL 数据目录（gdalvrt.xsd、WKT 定义等）：
+# 1) GDAL 数据目录（gdalvrt.xsd、WKT 定义等）：
 #    conda 环境默认位置 Library/share/gdal，打包为 gdal_data/
 def _find_gdal_share():
     candidates = []
@@ -143,9 +140,6 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
     excludes=excludes,
     noarchive=False,
 )

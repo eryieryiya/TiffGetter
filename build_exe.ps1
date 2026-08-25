@@ -153,7 +153,7 @@ Write-Host '     PASS: GUI 窗口正常启动（15s 内无异常退出，已自�
 
 Write-Host '[*] 验证 3/3: 归档关键数据检查...' -ForegroundColor Cyan
 $listing = & $py -m PyInstaller.utils.cliutils.archive_viewer -l $exe 2>$null
-foreach ($needle in @('config.yaml', 'gdalvrt.xsd', 'proj.db')) {
+foreach ($needle in @('gdalvrt.xsd', 'proj.db')) {
     $found = $listing -match [regex]::Escape($needle)
     if ($found) {
         Write-Host "     PASS: 包含 $needle" -ForegroundColor Green

@@ -168,7 +168,7 @@ data/output/batch/
 
 - Python 3.10+
 - [GDAL](https://gdal.org/)（用于 GeoTIFF 输出）
-- 依赖：`requests`, `pillow`, `numpy`, `rasterio`, `pyyaml`, `psutil`, `pyshp`, `pyproj`, `ttkbootstrap`, `tkintermapview`
+- 依赖：`requests`, `pillow`, `numpy`, `rasterio`, `psutil`, `pyshp`, `pyproj`, `ttkbootstrap`, `tkintermapview`
 
 ## 安装
 
@@ -180,7 +180,7 @@ conda activate satellite-image-processing
 或纯 pip：
 
 ```bash
-pip install requests pillow numpy rasterio pyyaml psutil pyshp pyproj ttkbootstrap tkintermapview
+pip install requests pillow numpy rasterio psutil pyshp pyproj ttkbootstrap tkintermapview
 ```
 
 ## 打包为独立 exe

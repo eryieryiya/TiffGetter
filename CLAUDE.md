@@ -9,7 +9,7 @@
 - `satellite_processor.py` - 历史影像获取逻辑（`WaybackImageFetcher`，含 `fetch_all_historical` / `fetch_batch_historical`）
 - `coordinate_loader.py` - CSV / SHP 批量坐标解析（`load_coordinates_file`）
 - `utils/cleanup.py` - 残余清理（`scan_residuals` / `cleanup_temp_tiles` / `delete_paths`）
-- `config.py` / `config.yaml` - 配置
+- `config.py` - 配置常量（`THREAD_POOL_SIZE` 与 `WGS84_WKT`）
 
 ## 数据源
 
