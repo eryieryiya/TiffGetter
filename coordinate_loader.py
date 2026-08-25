@@ -148,7 +148,7 @@ def load_coordinates(csv_path: str) -> List[Dict]:
 
         raw_id = row[id_idx].strip() if id_idx is not None and id_idx < len(row) else ""
         raw_name = row[name_idx].strip() if name_idx is not None and name_idx < len(row) else ""
-        fb = f"point_{row_no - 1}"
+        # raw_id/raw_name 已 strip，非空才清洗（空字符串避免无谓的清洗路径）
         safe_id = _safe_name(raw_id, "") if raw_id else ""
         safe_name = _safe_name(raw_name, "") if raw_name else ""
 
@@ -282,7 +282,8 @@ def load_coordinates_shp(shp_path: str) -> List[Dict]:
                 name_value = ""
 
         fb = f"feature_{idx}"
-        safe_id = _safe_name("", "")  # SHP 默认不暴露 id 字段
+        # SHP 默认不暴露 id 字段；后续按需回填到 feature_N
+        safe_id = ""
         safe_name = _safe_name(name_value, fb)
         # 若 name 是 feature_X，额外把 id 设为 idx 以便复用
         if safe_name == fb:

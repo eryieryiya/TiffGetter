@@ -11,7 +11,6 @@
 import sys
 import logging
 import argparse
-import os
 
 # 让 logger 走 stdout，GUI 端的日志面板能实时看到进度
 logging.basicConfig(

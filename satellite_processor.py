@@ -47,7 +47,7 @@ if not logger.handlers and not logging.getLogger().handlers:
     logger.addHandler(handler)
     logger.propagate = False
 
-from config import WGS84_WKT, CONFIG, THREAD_POOL_SIZE
+from config import WGS84_WKT, THREAD_POOL_SIZE
 
 # 自定义异常：瓦片未下载完整
 class IncompleteTilesError(Exception):
@@ -96,8 +96,8 @@ class WaybackImageFetcher:
         self.session = requests.Session()
         self.session.mount('https://', adapter)
         self.session.verify = False
-        # 从 config 读取线程数，缺省 10
-        self.thread_pool_size = CONFIG['processing'].get('thread_pool_size', THREAD_POOL_SIZE) or 10
+        # 线程池大小来自 config；fallback 为 10（与 config.py 中默认值一致）
+        self.thread_pool_size = THREAD_POOL_SIZE or 10
         self._downloaded_hashes = set()         # 字节级 MD5：100% 精确重复
         self._downloaded_dhashes: set = set()   # 感知级 dHash(int)：视觉重复
         self._probe_tile_dhashes: Dict[str, int] = {}  # 预筛：(坐标zoom -> release_id -> tile dhash)
@@ -281,8 +281,6 @@ class WaybackImageFetcher:
                 did_crop  : True 表示实际发生了裁剪（图像尺寸变小）；
                             False 表示 clip_rect 已与画布接近全同，未动文件。
         """
-        from PIL import Image
-
         c_min_lon, c_min_lat, c_max_lon, c_max_lat = canvas_bounds
         k_min_lon, k_min_lat, k_max_lon, k_max_lat = clip_rect
 
@@ -633,11 +631,7 @@ class WaybackImageFetcher:
         try:
             sz = cls.DHASH_SIZE
             gray = img.convert('L').resize((sz + 1, sz), Image.LANCZOS)
-            try:
-                # Pillow >= 10
-                px = gray.get_flattened_data()
-            except AttributeError:
-                px = list(gray.getdata())
+            px = list(gray.getdata())
             w = sz + 1
             bits = 0
             idx = 0
@@ -870,8 +864,7 @@ class WaybackImageFetcher:
             px_box = (0, 0, 0, 0)
 
         # 裁剪后的实际输出范围（米），用于日志
-        cos_lat2 = max(math.cos(math.radians(lat)), 1e-6)
-        out_ew_m = (new_bounds['max_lon'] - new_bounds['min_lon']) * 111320.0 * cos_lat2
+        out_ew_m = (new_bounds['max_lon'] - new_bounds['min_lon']) * 111320.0 * cos_lat
         out_ns_m = (new_bounds['max_lat'] - new_bounds['min_lat']) * 111320.0
         if did_crop:
             logger.info(
