@@ -884,14 +884,26 @@ class ImageFetcher:
         except Exception:
             probe_root = None  # 建目录失败就放弃预筛，不影响主流程
 
-        # ---------- 预填充：仅扫描同源文件，建 MD5 + dHash 两条索引 ----------
-        if os.path.exists(output_dir):
+        dates = self.get_available_dates(lat, lon, zoom)
+        dates = sorted(dates, key=lambda d: d['date'])
+
+        if date_range:
+            dates = [d for d in dates if date_range[0] <= d['date'] <= date_range[1]]
+            logger.info(f"日期筛选后剩余 {len(dates)} 个")
+
+        # 去重代表始终取最早日期：
+        # 预填充只纳入「早于本次最早候选日期」且位于请求区间内的同源输出，
+        # 避免已有较晚日期（或区间外日期）把区间内更早的影像判为重复而跳过。
+        first_candidate = dates[0]['date'] if dates else None
+        if not date_range and os.path.exists(output_dir):
             for date_dir in sorted(os.listdir(output_dir)):
                 date_dir_path = os.path.join(output_dir, date_dir)
                 png_path = os.path.join(date_dir_path, f'{date_dir}.png')
                 if not os.path.isdir(date_dir_path) or not os.path.exists(png_path):
                     continue
                 if self._read_metadata_source(date_dir_path) != self.info.name:
+                    continue
+                if first_candidate is not None and date_dir >= first_candidate:
                     continue
                 img_md5 = self.compute_image_hash(png_path)
                 img_dhash = self.compute_dhash_int_from_path(png_path)
@@ -900,12 +912,6 @@ class ImageFetcher:
                 if img_dhash is not None:
                     self._downloaded_dhashes.add(img_dhash)
                 logger.info(f"已存在: {date_dir}")
-
-        dates = self.get_available_dates(lat, lon, zoom)
-
-        if date_range:
-            dates = [d for d in dates if date_range[0] <= d['date'] <= date_range[1]]
-            logger.info(f"日期筛选后剩余 {len(dates)} 个")
 
         results = []
         skipped_duplicates = 0
@@ -995,6 +1001,30 @@ class ImageFetcher:
         # 清理：预筛目录用完即销毁（其内容对用户无意义）
         if probe_root and os.path.exists(probe_root):
             shutil.rmtree(probe_root, ignore_errors=True)
+
+        # ---------- 区间校验：最早保留影像必须落在请求区间内 ----------
+        if date_range:
+            kept_dates = []
+            if os.path.isdir(output_dir):
+                for name in os.listdir(output_dir):
+                    dir_path = os.path.join(output_dir, name)
+                    if not os.path.isdir(dir_path):
+                        continue
+                    if not os.path.exists(os.path.join(dir_path, f'{name}.png')):
+                        continue
+                    if self._read_metadata_source(dir_path) != self.info.name:
+                        continue
+                    if date_range[0] <= name <= date_range[1]:
+                        kept_dates.append(name)
+            if kept_dates:
+                logger.info(
+                    f"[区间校验] 区间内最早保留影像日期: {min(kept_dates)}"
+                    f"（区间 {date_range[0]} ~ {date_range[1]}）"
+                )
+            else:
+                logger.warning(
+                    f"[区间校验] 区间 {date_range[0]} ~ {date_range[1]} 内没有可用影像"
+                )
 
         success = sum(1 for r in results if r['status'] == 'success')
         failed = sum(1 for r in results if r['status'] == 'failed')

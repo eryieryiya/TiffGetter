@@ -500,6 +500,8 @@ data/output/batch/                  # wayback 默认；其它源为 data/output/
 
 - 仅在同一数据源内比较 MD5、dHash 与中心瓦片预筛结果，同一地点用不同数据源下载会各自保留。
 - 缺少 `metadata.json` 的旧输出按 `wayback` 处理。
+- 同一视觉组保留最早日期：按日期升序处理，后续相同影像标记为 `duplicate`。
+- 指定日期范围时，去重只与区间内的已有输出比较，避免区间外影像让区间内最早日期被跳过；结束时打印 `[区间校验] 区间内最早保留影像日期: ...`。
 - 结果状态：`success` / `existing` / `duplicate` / `failed` / `unsupported`。
 - 加 `--no-dedup` 关闭上述检测，每个历史日期都会单独下载并输出。
 
