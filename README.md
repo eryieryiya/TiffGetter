@@ -49,9 +49,9 @@
 
 - **ESRI Wayback**：历史影像的正解。日期来自 ESRI 官方 release 列表，不同日期可能发布完全相同的瓦片，默认会被去重。
 - **ESRI 当前影像**：与 Wayback 使用同一套 World Imagery 瓦片服务，但服务元数据 `timeInfo = null`，没有时间维度，因此只提供 `current`。需要 ESRI 历史请改用 `--source wayback`。
-- **Google Earth**：实验性数据源，依赖 Google 的非公开 TimeMachine 接口，可用日期、瓦片层级与接口本身都可能随时变化；部分日期只存在于特定层级，程序会自动向下探测。
+- **Google Earth**：实验性数据源，依赖 Google 的非公开 TimeMachine 接口，可用日期、瓦片层级与接口本身都可能随时变化；部分日期只存在于特定层级，程序会自动向下探测。GUI 中选择该数据源时会在下拉框下方显示使用边界提示。
 - **Bing**：仅提供当前影像，没有公开的历史影像接口。
-- **OpenStreetMap**：实时渲染瓦片，不提供按日期的历史快照；并发上限固定为 2。OSM 可能用 HTTP 200 返回 “Access blocked” 拦截页（响应头 `X-Blocked`），程序会识别并拒绝保存；遇到时请降低频率、等待解封或改用其它数据源。地图选点支持 Esri 卫星图 / 矢量图底图切换，不受 OSM 限流影响。
+- **OpenStreetMap**：实时渲染瓦片，不提供按日期的历史快照；并发上限固定为 2。OSM 可能用 HTTP 200 返回 “Access blocked” 拦截页（响应头 `X-Blocked`），程序会识别并拒绝保存；遇到时请降低频率、等待解封或改用其它数据源。GUI 中选择 OSM 时会显示边界提示（公共瓦片仅适合轻量、单点使用），批量下载启动前还会弹出二次确认，可取消。地图选点支持 Esri 卫星图 / 矢量图底图切换，不受 OSM 限流影响。
 
 统一限制：
 
@@ -321,6 +321,12 @@ pip install requests pillow numpy rasterio psutil pyshp pyproj ttkbootstrap tkin
 
 ```bash
 python -m pytest
+```
+
+`pytest` 与 `ruff` 的配置统一放在 `pyproject.toml`。静态检查：
+
+```bash
+python -m ruff check .
 ```
 
 ## 打包为独立 exe

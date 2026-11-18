@@ -63,8 +63,9 @@ docs/superpowers/
 *.orig
 *_BACKUP_*
 
-# 本地运行产物
+# 本地运行产物（core dump）；仓库源码包 core/ 需入库，故对目录做例外
 core
+!core/
 *.core
 
 # omo

@@ -34,6 +34,7 @@ _SOURCES: Dict[str, SourceInfo] = {
         max_concurrency=4,
         attribution='Google',
         experimental=True,
+        usage_note='实验性：使用非公开接口，可能随时失效；不建议用于生产批量任务。',
     ),
     'bing': SourceInfo(
         name='bing',
@@ -52,6 +53,7 @@ _SOURCES: Dict[str, SourceInfo] = {
         max_zoom=19,
         max_concurrency=2,
         attribution='© OpenStreetMap contributors',
+        usage_note='OSM 公共瓦片仅适合轻量、单点使用；批量下载请改用 ESRI 或 Bing，否则可能被限流或封禁。',
     ),
 }
 
@@ -79,6 +81,13 @@ def list_sources() -> List[SourceInfo]:
 def source_names() -> List[str]:
     """返回全部已注册数据源名称。"""
     return list(_SOURCES.keys())
+
+
+def source_usage_note(name: Optional[str] = None) -> str:
+    """返回数据源的使用边界提示；未知名称返回空字符串。"""
+    key = (name or "").strip().lower()
+    info = _SOURCES.get(key)
+    return info.usage_note if info else ""
 
 
 def get_source(name: Optional[str] = None) -> TileSource:

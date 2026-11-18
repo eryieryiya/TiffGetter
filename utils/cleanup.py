@@ -1,10 +1,14 @@
 """
 utils/cleanup.py - 残余清理模块
 
-提供两个工具函数：
-- cleanup_temp_tiles(root_dir): 清理临时瓦片目录，返回清理路径列表
+提供临时瓦片目录的心跳与清理策略：
+- create_temp_dir(root_dir, source, date_str): 创建带心跳的临时瓦片目录
+- touch_temp_heartbeat(dir_path): 刷新心跳文件 mtime
+- is_temp_dir_active(dir_path, ttl): 依据心跳判断目录是否仍在使用
+- cleanup_stale_temp_tiles(root_dir, ttl): 仅清理过期（心跳超时）目录
+- cleanup_temp_tiles(root_dir): 强制清理全部临时瓦片目录（危险，仅供显式调用）
 - scan_residuals(root_dir): 扫描所有可清理项（temp_tiles_*、data/output 下的 release 目录），
-                           返回 [{path, kind, size_bytes, mtime, is_dir}]
+                           返回 [{path, kind, size_bytes, mtime, is_dir, active}]
 
 data/output 支持多数据源与批量输出结构：
 - wayback 单点：data/output/historical/<date>/
@@ -19,10 +23,71 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
+import time
 from typing import Dict, List
 
 # data/output 下允许扫描的最大相对深度（覆盖 source/batch/coord/release 结构）
 _MAX_OUTPUT_DEPTH = 4
+
+# 临时目录心跳文件名与默认过期时间（秒）
+TEMP_HEARTBEAT_NAME = ".active"
+TEMP_TTL_SECONDS = 1800
+
+
+def create_temp_dir(root_dir: str, source: str, date_str: str) -> str:
+    """在 root_dir 下创建带 PID/随机后缀的临时瓦片目录并写入心跳。"""
+    prefix = f"temp_tiles_{source}_{date_str}_{os.getpid()}_"
+    path = tempfile.mkdtemp(prefix=prefix, dir=root_dir)
+    touch_temp_heartbeat(path)
+    return path
+
+
+def touch_temp_heartbeat(dir_path: str) -> None:
+    """刷新心跳文件 mtime；任何失败静默忽略。"""
+    heartbeat = os.path.join(dir_path, TEMP_HEARTBEAT_NAME)
+    try:
+        with open(heartbeat, "a"):
+            pass
+        os.utime(heartbeat, None)
+    except OSError:
+        pass
+
+
+def is_temp_dir_active(dir_path: str, ttl: int = TEMP_TTL_SECONDS) -> bool:
+    """判断临时目录是否仍在使用：以心跳 mtime 为准，缺失时回退目录 mtime。"""
+    heartbeat = os.path.join(dir_path, TEMP_HEARTBEAT_NAME)
+    try:
+        mtime = os.path.getmtime(heartbeat)
+    except OSError:
+        try:
+            mtime = os.path.getmtime(dir_path)
+        except OSError:
+            return False
+    return (time.time() - mtime) < ttl
+
+
+def cleanup_stale_temp_tiles(root_dir: str,
+                             ttl: int = TEMP_TTL_SECONDS) -> List[str]:
+    """仅清理已过期（心跳超时）的 temp_tiles_* 目录，返回已清理路径列表。"""
+    removed: List[str] = []
+    try:
+        entries = os.listdir(root_dir)
+    except OSError:
+        return removed
+
+    for entry in entries:
+        full = os.path.join(root_dir, entry)
+        if not (os.path.isdir(full) and entry.startswith('temp_tiles_')):
+            continue
+        if is_temp_dir_active(full, ttl=ttl):
+            continue
+        try:
+            shutil.rmtree(full, ignore_errors=True)
+            removed.append(full)
+        except Exception:
+            pass
+    return removed
 
 
 def _is_release_dir(dirpath: str, filenames: List[str]) -> bool:
@@ -42,6 +107,7 @@ def scan_residuals(root_dir: str) -> List[Dict]:
             size_bytes: 目录占用字节
             mtime: 最近修改时间戳
             is_dir: 是否目录
+            active: 是否仍在使用（仅 temp_tiles 有意义）
     """
     items: List[Dict] = []
 
@@ -56,6 +122,7 @@ def scan_residuals(root_dir: str) -> List[Dict]:
                     "size_bytes": _dir_size(full),
                     "mtime": os.path.getmtime(full),
                     "is_dir": True,
+                    "active": is_temp_dir_active(full),
                 })
     except OSError:
         pass
@@ -75,6 +142,7 @@ def scan_residuals(root_dir: str) -> List[Dict]:
                     "size_bytes": _dir_size(dirpath),
                     "mtime": os.path.getmtime(dirpath),
                     "is_dir": True,
+                    "active": False,
                 })
                 dirnames[:] = []  # 命中 release 目录后剪枝
                 continue
@@ -87,7 +155,11 @@ def scan_residuals(root_dir: str) -> List[Dict]:
 
 
 def cleanup_temp_tiles(root_dir: str) -> List[str]:
-    """仅清理 temp_tiles_* 目录，返回已清理路径列表。"""
+    """强制清理全部 temp_tiles_* 目录，返回已清理路径列表。
+
+    WARNING: 危险操作——不检查心跳，会删除其他进程正在使用的临时目录。
+    正常运行流程请使用 cleanup_stale_temp_tiles()。
+    """
     removed: List[str] = []
     try:
         entries = os.listdir(root_dir)

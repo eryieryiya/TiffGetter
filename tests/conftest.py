@@ -49,24 +49,28 @@ def sample_png(tmp_path: Path):
 
 @pytest.fixture
 def no_cleanup(monkeypatch):
-    """将 ImageFetcher 启动时的残留清理替换为 no-op。
+    """将 ImageFetcher 启动时的残留清理替换为受控版本。
 
-    ImageFetcher.__init__ 会调用 _cleanup_residual_temp_tiles()，真实实现会删除
-    仓库根目录下的 temp_tiles_* 目录。测试中必须隔离该行为。
+    __init__ 调用（root_dir=None）保持 no-op，避免删除仓库根目录下的
+    temp_tiles_* 目录；测试显式传入 root_dir 时仍执行真实的过期清理逻辑。
     """
 
     import satellite_processor
 
-    def _noop(self, root_dir=None):
-        return []
+    original = satellite_processor.ImageFetcher._cleanup_residual_temp_tiles
+
+    def _guarded(self, root_dir=None):
+        if root_dir is None:
+            return []
+        return original(self, root_dir)
 
     monkeypatch.setattr(
         satellite_processor.ImageFetcher,
         "_cleanup_residual_temp_tiles",
-        _noop,
+        _guarded,
         raising=True,
     )
-    return _noop
+    return _guarded
 
 
 @pytest.fixture

@@ -16,6 +16,7 @@ import pytest
 from PIL import Image
 
 import satellite_processor
+import utils.cleanup as cleanup_utils
 from providers.base import SourceInfo, TileSource
 from satellite_processor import ImageFetcher
 
@@ -63,7 +64,7 @@ def make_fetcher(fetcher_factory, monkeypatch, tmp_path):
     mkdtemp_root.mkdir()
     real_mkdtemp = tempfile.mkdtemp
     monkeypatch.setattr(
-        satellite_processor.tempfile,
+        cleanup_utils.tempfile,
         "mkdtemp",
         lambda prefix=None, dir=None: real_mkdtemp(prefix=prefix, dir=str(mkdtemp_root)),
     )

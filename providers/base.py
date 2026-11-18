@@ -18,6 +18,7 @@ class SourceInfo:
     max_concurrency: int
     attribution: str
     experimental: bool = False
+    usage_note: str = ""
 
 
 class UnknownSourceError(ValueError):
