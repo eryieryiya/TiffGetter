@@ -527,7 +527,8 @@ data/output/batch/                  # wayback 默认；其它源为 data/output/
 - **降低并发**：批量模式并发数改为 1
 - **缩小缓冲区**：5000m → 500m，瓦片数从 ~50 减到 ~5
 - **降低缩放级别**：18 → 17 或 16
-- **网络问题**：检查代理 / 防火墙是否允许访问对应数据源域名：`*.arcgisonline.com` / `*.maptiles.arcgis.com`（ESRI）、`*.virtualearth.net`（Bing）、`*.tile.openstreetmap.org`（OSM）、Google Earth 相关端点
+- **网络问题**：检查代理 / 防火墙是否允许访问对应数据源域名：`*.arcgisonline.com` / `*.maptiles.arcgis.com`（ESRI）、`*.virtualearth.net`（Bing）、`tile.openstreetmap.org`（OSM）、Google Earth 相关端点
+- **OSM 403 Access blocked**：OSM 可能用 HTTP 200 返回拦截图，响应头 `X-Blocked` 会被识别，拦截图不会写入输出；请等待 IP 解封或改用其它数据源。地图选点支持 Esri 卫星图 / 矢量图切换，可正常使用。
 
 ### Q3：某个日期版本下载失败？
 

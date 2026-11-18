@@ -51,7 +51,7 @@
 - **ESRI 当前影像**：与 Wayback 使用同一套 World Imagery 瓦片服务，但服务元数据 `timeInfo = null`，没有时间维度，因此只提供 `current`。需要 ESRI 历史请改用 `--source wayback`。
 - **Google Earth**：实验性数据源，依赖 Google 的非公开 TimeMachine 接口，可用日期、瓦片层级与接口本身都可能随时变化；部分日期只存在于特定层级，程序会自动向下探测。
 - **Bing**：仅提供当前影像，没有公开的历史影像接口。
-- **OpenStreetMap**：实时渲染瓦片，不提供按日期的历史快照；并发上限固定为 2。
+- **OpenStreetMap**：实时渲染瓦片，不提供按日期的历史快照；并发上限固定为 2。OSM 可能用 HTTP 200 返回 “Access blocked” 拦截页（响应头 `X-Blocked`），程序会识别并拒绝保存；遇到时请降低频率、等待解封或改用其它数据源。地图选点支持 Esri 卫星图 / 矢量图底图切换，不受 OSM 限流影响。
 
 统一限制：
 
