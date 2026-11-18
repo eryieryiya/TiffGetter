@@ -11,7 +11,7 @@
 - 多数据源可选，默认 **ESRI Wayback**（历史影像）
 - 支持日期范围筛选（仅支持历史版本的数据源）
 - 可调节缩放级别（1-20）和缓冲区大小
-- 多线程并发下载，自动 MD5 + dHash 去重（按数据源隔离）
+- 多线程并发下载，自动 MD5 + dHash 去重（按数据源隔离），可用 `--no-dedup` 关闭
 - 输出 GeoTIFF（带地理参考）和 PNG 预览
 - 每个输出目录写入 `metadata.json`（数据源、版本、版权、范围、参数）
 - 提供命令行和图形界面两种使用方式
@@ -33,6 +33,32 @@
 - 不支持历史版本的数据源只返回一个 `current` 版本，输出目录为 `current/`。
 - 请求的缩放级别超过数据源上限时会自动截断到上限并给出警告。
 - 未注册的 `--source` 以退出码 2 结束，并列出可选数据源。
+
+## 能力边界
+
+先按需求选数据源，避免把“数据源不提供历史”误判为下载失败：
+
+| 需求 | 应使用 | 说明 |
+|---|---|---|
+| 某点的 ESRI 历史影像 | `wayback` | ESRI 官方历史存档，按 release 日期逐版本输出 |
+| 某点的 Google 历史影像 | `google` | 实验性 TimeMachine 接口，可用日期取决于该坐标的存档 |
+| 只要最新影像 | `esri` / `bing` / `osm` | 仅返回一个 `current`，没有历史版本 |
+| 保留每一个历史日期目录 | `wayback` / `google` + `--no-dedup` | 关闭去重后，即使影像视觉相同也按日期各写一份 |
+
+各数据源的边界：
+
+- **ESRI Wayback**：历史影像的正解。日期来自 ESRI 官方 release 列表，不同日期可能发布完全相同的瓦片，默认会被去重。
+- **ESRI 当前影像**：与 Wayback 使用同一套 World Imagery 瓦片服务，但服务元数据 `timeInfo = null`，没有时间维度，因此只提供 `current`。需要 ESRI 历史请改用 `--source wayback`。
+- **Google Earth**：实验性数据源，依赖 Google 的非公开 TimeMachine 接口，可用日期、瓦片层级与接口本身都可能随时变化；部分日期只存在于特定层级，程序会自动向下探测。
+- **Bing**：仅提供当前影像，没有公开的历史影像接口。
+- **OpenStreetMap**：实时渲染瓦片，不提供按日期的历史快照；并发上限固定为 2。
+
+统一限制：
+
+- 只有 `wayback` 与 `google` 接受 `--date-range`；其它数据源传入时直接以退出码 2 结束。
+- CLI 启动时会打印 `版本能力: 支持历史版本` 或 `版本能力: 仅当前影像（数据源本身无历史存档）`。
+- 非历史源的输出固定为 `<输出目录>/current/current.png|tif`。
+- 默认开启去重（中心瓦片预筛 + 整图 MD5/dHash），因此“请求 N 个日期只得到少量目录”属于正常现象；需要全部日期时加 `--no-dedup`。
 
 ## 使用方法
 
@@ -61,7 +87,22 @@ python main.py --lat 35.6586 --lon 139.7454 --output ./output
 
 # 日期范围筛选（仅 wayback / google 支持）
 python main.py --lat 35.6586 --lon 139.7454 --date-range 2020-01-01 2024-12-31
+
+# 获取 2022-2025 的每一个历史日期（不去重）
+python main.py --source wayback --lat 35.6586 --lon 139.7454 \
+    --zoom 17 --buffer 500 --no-dedup \
+    --date-range 2022-01-01 2025-12-31 --output ./wayback_all
+
+# Google Earth 历史影像（实验性）
+python main.py --source google --lat 35.6586 --lon 139.7454 \
+    --zoom 17 --buffer 500 --no-dedup \
+    --date-range 2022-01-01 2025-12-31 --output ./google_all
+
+# 当前影像（esri / bing / osm 只输出 current，不能带 --date-range）
+python main.py --source bing --lat 35.6586 --lon 139.7454 --zoom 17 --buffer 500
 ```
+
+`--no-dedup` 与 `--date-range` 组合时，数据源返回多少个日期，就输出多少个日期目录；不使用 `--no-dedup` 时，视觉相同的日期会被合并，属预期行为。
 
 #### 批量模式（CSV / SHP）
 
@@ -148,6 +189,7 @@ python ui_main.py
 | `--output` | 输出目录 | wayback → `data/output/historical`；其它 → `data/output/<source>` |
 | `--date-range` | 日期范围筛选（起始 截止，仅支持历史的数据源） | 全部 |
 | `--coord-concurrency` | 批量模式下坐标并发数 (1-16) | 1 |
+| `--no-dedup` | 关闭重复检测，每个历史日期都单独输出 | 关闭（默认去重） |
 
 ### 单点模式（与 `--coords-file` 互斥）
 
@@ -242,6 +284,7 @@ data/output/esri/                     # 非历史源
 - 去重索引（MD5、dHash、中心瓦片预筛）仅在**同一数据源内**比较，同一地点用不同数据源下载会各自保留。
 - 扫描已有输出时，只纳入 `metadata.json` 中 `source` 与本次一致的文件。
 - 缺少 `metadata.json` 的旧输出按 `wayback` 处理，保持向后兼容。
+- 需要保留下载到的每个历史日期时，加 `--no-dedup`：跳过中心瓦片预筛与整图去重，即使影像视觉相同也各写一个日期目录。
 
 ## 版权与使用限制
 

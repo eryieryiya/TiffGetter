@@ -31,7 +31,7 @@ TiffGetter 是一个 Windows 桌面程序（支持 macOS / Linux 开发态），
 - 批量下载：CSV / SHP 文件导入坐标点，依次处理
 - 地图选点：内置 OpenStreetMap 地图可视化选点
 - 日期范围筛选：只下载指定时间段内的历史版本（仅支持历史的数据源）
-- 智能去重：基于 PNG 哈希，自动跳过与之前版本重复的影像（按数据源隔离）
+- 智能去重：基于 PNG 哈希，自动跳过与之前版本重复的影像（按数据源隔离）；加 `--no-dedup` 可保留每个日期
 - 多 Tab 界面：单点 / 批量 / 清理三个独立工作区
 - 主题切换：8 套暗色 + 亮色配色（tokyo-night、everforest、dracula、catppuccin、nord、gruvbox、vapor、minty）
 
@@ -437,6 +437,7 @@ TiffGetter.exe --help
 | `--buffer` | 缓冲区大小（米，50-5000，默认 500） |
 | `--date-range START END` | 日期范围筛选，如 `2020-01-01 2024-12-31`（非历史源不可用，退出码 2） |
 | `--coord-concurrency N` | 批量模式并发数 1-16（默认 1） |
+| `--no-dedup` | 关闭重复检测，每个历史日期都单独输出（默认去重） |
 
 ---
 
@@ -500,6 +501,7 @@ data/output/batch/                  # wayback 默认；其它源为 data/output/
 - 仅在同一数据源内比较 MD5、dHash 与中心瓦片预筛结果，同一地点用不同数据源下载会各自保留。
 - 缺少 `metadata.json` 的旧输出按 `wayback` 处理。
 - 结果状态：`success` / `existing` / `duplicate` / `failed` / `unsupported`。
+- 加 `--no-dedup` 关闭上述检测，每个历史日期都会单独下载并输出。
 
 ### GeoTIFF 文件
 
@@ -531,7 +533,7 @@ data/output/batch/                  # wayback 默认；其它源为 data/output/
 
 ### Q4：某些日期明明在 ESRI 网站上能看到，但下载结果是「重复」？
 
-ESRI、Google 等数据源经常在多个日期 ID 上发布相同瓦片数据，程序通过 PNG 哈希自动去重，避免重复下载占用空间。被标记「重复」的日期是真正无差异的版本，并非下载失败。去重仅在**同一数据源内**生效，不同数据源下载的同一地点不会被判为重复。
+ESRI、Google 等数据源经常在多个日期 ID 上发布相同瓦片数据，程序通过 PNG 哈希自动去重，避免重复下载占用空间。被标记「重复」的日期是真正无差异的版本，并非下载失败。去重仅在**同一数据源内**生效，不同数据源下载的同一地点不会被判为重复。若需要每个日期都有独立目录，使用 `--no-dedup`。
 
 ### Q5：GUI 卡顿？
 
