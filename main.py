@@ -145,11 +145,11 @@ def main():
     else:
         print("版本能力: 仅当前影像（数据源本身无历史存档）")
     if args.coords_file:
-        print(f"模式: 批量")
+        print("模式: 批量")
         print(f"坐标文件: {args.coords_file}")
         print(f"并发: {args.coord_concurrency}")
     else:
-        print(f"模式: 单点")
+        print("模式: 单点")
         print(f"坐标: ({args.lat}, {args.lon})")
     print(f"缩放级别: {args.zoom}")
     print(f"输出目录: {output_dir}")

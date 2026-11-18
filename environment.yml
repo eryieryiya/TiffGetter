@@ -27,4 +27,5 @@ dependencies:
     - tkintermapview   # 提供交互式 Tk 地图控件（基于在线瓦片，需联网）
 
     # ---- 测试（全部离线运行，不依赖网络） ----
-    - pytest     # 离线自动化测试框架（配置见仓库根目录 pytest.ini）
+    - pytest     # 离线自动化测试框架（配置见仓库根目录 pyproject.toml）
+    - ruff       # 代码静态检查（未使用导入、未定义名称、语法错误等）

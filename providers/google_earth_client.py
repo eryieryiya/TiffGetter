@@ -1,12 +1,10 @@
 # Google Earth 历史影像API客户端 - 通过Flatfile API获取历史卫星影像
 
-import os
 import struct
 import zlib
 import logging
 import requests
 import threading
-from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
 
@@ -246,11 +244,7 @@ def decompress_packet(data: bytes) -> bytes:
     
     magic = struct.unpack('<I', data[:4])[0]
     
-    if magic == PACKET_MAGIC:
-        decomp_size = struct.unpack('<I', data[4:8])[0]
-    elif magic == PACKET_MAGIC_SWAP:
-        decomp_size = struct.unpack('>I', data[4:8])[0]
-    else:
+    if magic not in (PACKET_MAGIC, PACKET_MAGIC_SWAP):
         return data
     
     try:
