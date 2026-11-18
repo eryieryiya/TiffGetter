@@ -3,8 +3,15 @@ utils/cleanup.py - 残余清理模块
 
 提供两个工具函数：
 - cleanup_temp_tiles(root_dir): 清理临时瓦片目录，返回清理路径列表
-- scan_residuals(root_dir): 扫描所有可清理项（temp_tiles_*、历史日期子目录），
+- scan_residuals(root_dir): 扫描所有可清理项（temp_tiles_*、data/output 下的 release 目录），
                            返回 [{path, kind, size_bytes, mtime, is_dir}]
+
+data/output 支持多数据源与批量输出结构：
+- wayback 单点：data/output/historical/<date>/
+- 非 wayback 单点：data/output/<source>/<current|date>/
+- 批量：data/output/.../<coord>/<current|date>/
+仅当目录包含 metadata.json 或同名 PNG 时视为 release 目录，识别后剪枝，不扫描其子目录；
+不扫描 data/input，本模块扫描函数只读不删。
 
 供 GUI Tab 3 "清理与维护" 使用。
 """
@@ -14,14 +21,24 @@ import os
 import shutil
 from typing import Dict, List
 
+# data/output 下允许扫描的最大相对深度（覆盖 source/batch/coord/release 结构）
+_MAX_OUTPUT_DEPTH = 4
+
+
+def _is_release_dir(dirpath: str, filenames: List[str]) -> bool:
+    """目录包含 metadata.json 或与目录同名的 PNG 时视为 release 目录。"""
+    if 'metadata.json' in filenames:
+        return True
+    return f"{os.path.basename(dirpath)}.png" in filenames
+
 
 def scan_residuals(root_dir: str) -> List[Dict]:
-    """扫描根目录及 data/output/historical/ 下所有可清理条目。
+    """扫描根目录及 data/output/ 下所有可清理条目。
 
     Returns:
         每项：
             path: 绝对路径
-            kind: "temp_tiles" | "historical_date" | "other"
+            kind: "temp_tiles" | "historical_date"
             size_bytes: 目录占用字节
             mtime: 最近修改时间戳
             is_dir: 是否目录
@@ -43,19 +60,26 @@ def scan_residuals(root_dir: str) -> List[Dict]:
     except OSError:
         pass
 
-    # 2) data/output/historical/ 下的日期子目录
-    hist_dir = os.path.join(root_dir, 'data', 'output', 'historical')
-    if os.path.isdir(hist_dir):
-        for date_sub in os.listdir(hist_dir):
-            full = os.path.join(hist_dir, date_sub)
-            if os.path.isdir(full):
+    # 2) data/output/ 下的 release 目录（多数据源、批量结构）
+    output_root = os.path.join(root_dir, 'data', 'output')
+    if os.path.isdir(output_root):
+        for dirpath, dirnames, filenames in os.walk(output_root, topdown=True):
+            rel = os.path.relpath(dirpath, output_root)
+            depth = 0 if rel == os.curdir else rel.count(os.sep) + 1
+            if depth == 0:
+                continue
+            if _is_release_dir(dirpath, filenames):
                 items.append({
-                    "path": full,
+                    "path": dirpath,
                     "kind": "historical_date",
-                    "size_bytes": _dir_size(full),
-                    "mtime": os.path.getmtime(full),
+                    "size_bytes": _dir_size(dirpath),
+                    "mtime": os.path.getmtime(dirpath),
                     "is_dir": True,
                 })
+                dirnames[:] = []  # 命中 release 目录后剪枝
+                continue
+            if depth >= _MAX_OUTPUT_DEPTH:
+                dirnames[:] = []  # 限制递归深度
 
     # 按 mtime 倒序（新→旧）
     items.sort(key=lambda x: x['mtime'], reverse=True)

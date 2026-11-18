@@ -1,21 +1,38 @@
-# TiffGetter - ESRI Wayback 历史影像获取工具
+# TiffGetter - 多数据源卫星影像获取工具
 
-获取坐标点的所有历史时期卫星影像（ESRI Wayback 数据源），生成带地理参考的 GeoTIFF/PNG 文件。
+获取坐标点的历史或当前卫星影像，生成带地理参考的 GeoTIFF/PNG 文件。支持 **ESRI Wayback、ESRI 当前影像、Google Earth（实验性）、Bing、OpenStreetMap** 五个数据源。
 
 支持单点下载与批量下载（CSV / SHP）；提供命令行与图形界面两种使用方式。
 
 ## 功能
 
-- 输入单个坐标（经纬度），获取该点所有历史时期的卫星影像
+- 输入单个坐标（经纬度），获取该点在所选数据源下的历史或当前影像
 - 批量下载：CSV / SHP 文件批量坐标，Point 直接取点、Polygon 自动取 centroid
-- 数据源自 **ESRI Wayback**，提供全球历史卫星影像
-- 支持日期范围筛选
+- 多数据源可选，默认 **ESRI Wayback**（历史影像）
+- 支持日期范围筛选（仅支持历史版本的数据源）
 - 可调节缩放级别（1-20）和缓冲区大小
-- 多线程并发下载，自动 MD5 去重
+- 多线程并发下载，自动 MD5 + dHash 去重（按数据源隔离）
 - 输出 GeoTIFF（带地理参考）和 PNG 预览
+- 每个输出目录写入 `metadata.json`（数据源、版本、版权、范围、参数）
 - 提供命令行和图形界面两种使用方式
 - GUI 三 Tab：单点下载（含地图选点）/ 批量下载 / 清理与维护
 - 启动时自动清理 `temp_tiles_*` 临时瓦片残余
+
+## 数据源
+
+`--source` 可选值与能力如下（并发上限为实际下载线程数，线程池更大时也会被限制到该值）：
+
+| source | 名称 | 历史版本 | 最大 zoom | 并发 | 版权 / 归属 |
+|---|---|---|---|---|---|
+| `wayback`（默认） | ESRI Wayback | 支持 | 20 | 10 | Esri World Imagery Wayback |
+| `esri` | ESRI 当前影像 | 不支持 | 18 | 8 | Esri World Imagery |
+| `google` | Google Earth（实验性） | 支持（实验性） | 20 | 4 | Google |
+| `bing` | Bing 影像 | 不支持 | 19 | 4 | Microsoft Bing Maps |
+| `osm` | OpenStreetMap | 不支持 | 19 | 2 | © OpenStreetMap contributors |
+
+- 不支持历史版本的数据源只返回一个 `current` 版本，输出目录为 `current/`。
+- 请求的缩放级别超过数据源上限时会自动截断到上限并给出警告。
+- 未注册的 `--source` 以退出码 2 结束，并列出可选数据源。
 
 ## 使用方法
 
@@ -24,16 +41,25 @@
 #### 单点模式（向后兼容）
 
 ```bash
-# 基本用法 - 获取东京塔的历史影像
+# 基本用法 - 获取东京塔的 Wayback 历史影像（默认数据源）
 python main.py --lat 35.6586 --lon 139.7454
+
+# 显式指定 Wayback 历史影像
+python main.py --lat 35.6586 --lon 139.7454 --source wayback
+
+# ESRI 当前影像（不支持 --date-range）
+python main.py --lat 35.6586 --lon 139.7454 --source esri
+
+# OpenStreetMap 当前影像（并发上限 2）
+python main.py --lat 35.6586 --lon 139.7454 --source osm --zoom 18
 
 # 指定缩放级别和缓冲区大小
 python main.py --lat 35.6586 --lon 139.7454 --zoom 18 --buffer 500
 
-# 指定输出目录
+# 指定输出目录（不再在其下追加数据源层级）
 python main.py --lat 35.6586 --lon 139.7454 --output ./output
 
-# 日期范围筛选
+# 日期范围筛选（仅 wayback / google 支持）
 python main.py --lat 35.6586 --lon 139.7454 --date-range 2020-01-01 2024-12-31
 ```
 
@@ -45,6 +71,9 @@ python main.py --coords-file points.csv --output ./batch_out
 
 # SHP 文件（自动读 .prj 转 WGS84，Polygon 取 centroid）
 python main.py --coords-file sites.shp --output ./batch_out
+
+# 指定数据源（所有坐标点共用）
+python main.py --coords-file points.csv --source bing --output ./batch_out
 
 # 日期范围 + 并发数
 python main.py --coords-file points.csv --date-range 2024-01-01 2024-12-31 \
@@ -80,15 +109,18 @@ python ui_main.py
 |-----|------|
 | 单点下载 | 坐标/参数/日期/输出 + 地图选点（点击地图选坐标） |
 | 批量下载 | CSV/SHP 文件选择 + 预览 + 通用参数 + 结果表 |
-| 清理与维护 | 扫描残留（temp_tiles_*/历史日期目录）+ 勾选 + 二次确认删除 |
+| 清理与维护 | 扫描残留（temp_tiles_*/所有数据源 release 目录）+ 勾选 + 二次确认删除 |
+
+顶部工具条的「数据源」下拉框由单点 / 批量两个 Tab 共用，切换时联动日期范围可用性、缩放上限、默认输出目录，并显示当前数据源版权与实验性提示。
 
 | 区域 | 参数 | 说明 |
 |------|------|------|
+| 数据源 | wayback / esri / google / bing / osm | 默认 ESRI Wayback；子进程显式传递 `--source` |
 | 坐标 | 纬度、经度 | 目标点坐标（单点 Tab） |
-| 参数设置 | 缩放级别 (1-20) | 地图瓦片缩放级别 |
+| 参数设置 | 缩放级别 (1-20，随数据源) | 地图瓦片缩放级别，非历史源上限较低 |
 | | 缓冲区（米，50-5000） | 下载范围半径 |
-| 日期范围 | 起始 / 截止（可选） | 筛选特定时间段的影像 |
-| 输出设置 | 输出目录 | 下载文件保存路径 |
+| 日期范围 | 起始 / 截止（可选） | 仅支持历史版本的数据源可用 |
+| 输出设置 | 输出目录 | 下载文件保存路径，默认随数据源变化 |
 | 批量文件 | CSV / SHP 文件 | 批量下载 Tab |
 | | 坐标并发数 (1-16) | 坐标级并发，默认 1（避免限流） |
 
@@ -110,10 +142,11 @@ python ui_main.py
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--zoom` | 缩放级别 (1-20) | 18 |
+| `--source` | 数据源：`wayback` / `esri` / `google` / `bing` / `osm` | `wayback` |
+| `--zoom` | 缩放级别 (1-20，按数据源上限截断) | 18 |
 | `--buffer` | 缓冲区大小（米） | 500 |
-| `--output` | 输出目录 | data/output/historical |
-| `--date-range` | 日期范围筛选（起始 截止） | 全部 |
+| `--output` | 输出目录 | wayback → `data/output/historical`；其它 → `data/output/<source>` |
+| `--date-range` | 日期范围筛选（起始 截止，仅支持历史的数据源） | 全部 |
 | `--coord-concurrency` | 批量模式下坐标并发数 (1-16) | 1 |
 
 ### 单点模式（与 `--coords-file` 互斥）
@@ -133,36 +166,90 @@ python ui_main.py
 
 ### 单点模式
 
+默认路径随数据源变化：
+
+- `wayback`：`data/output/historical/<date>/<date>.png|tif`（与旧版一致，不追加 source 层级）
+- 其它数据源：`data/output/<source>/current/current.png|tif`
+- 显式传入 `--output <dir>`：严格写入该目录，不再自动追加数据源或 `current` 层级
+
 ```
-data/output/historical/
-├── 2024-01-15/
-│   ├── 2024-01-15.png
-│   └── 2024-01-15.tif
-├── 2023-06-20/
-│   ├── 2023-06-20.png
-│   └── 2023-06-20.tif
-└── ...
+data/output/
+├── historical/                 # wayback 默认
+│   ├── 2024-01-15/
+│   │   ├── 2024-01-15.png
+│   │   ├── 2024-01-15.tif
+│   │   └── metadata.json
+│   └── ...
+├── esri/                       # --source esri 默认
+│   └── current/
+│       ├── current.png
+│       ├── current.tif
+│       └── metadata.json
+├── bing/
+│   └── current/...
+└── osm/
+    └── current/...
 ```
 
 ### 批量模式
 
+输出根目录同样随数据源变化（GUI 批量默认 wayback → `data/output/batch`，其它 → `data/output/<source>`；CLI 未指定 `--output` 时 wayback 为 `data/output/historical`），每个坐标点一个独立子目录：
+
 ```
-data/output/batch/
-├── tokyo_tower/                  # id 优先；否则 name；否则 point_N_lat_lon
-│   ├── 2024-01-15/
+data/output/batch/                    # wayback
+├── tokyo_tower/                      # id 优先；否则 name；否则 point_N_lat_lon
+│   ├── 2024-01-15/                   # 历史源：日期目录
 │   │   ├── 2024-01-15.png
-│   │   └── 2024-01-15.tif
-│   └── 2023-06-20/
-│       ├── 2023-06-20.png
-│       └── 2023-06-20.tif
-├── Tiananmen/
-│   ├── ...
+│   │   ├── 2024-01-15.tif
+│   │   └── metadata.json
+│   └── 2023-06-20/...
 └── ...
+
+data/output/esri/                     # 非历史源
+└── tokyo_tower/
+    └── current/                      # 非历史源：current 目录
+        ├── current.png
+        ├── current.tif
+        └── metadata.json
 ```
 
-每个历史日期包含：
+每个 release 目录包含：
+
 - `*.png` — 卫星影像预览图
 - `*.tif` — 带地理参考的 GeoTIFF（CRS: EPSG:4326 WGS84）
+- `metadata.json` — 数据源、版本、版权、坐标、缩放、缓冲区、边界、采集时间与文件列表
+
+### metadata.json
+
+```json
+{
+  "source": "esri",
+  "release_id": "current",
+  "release_date": "current",
+  "attribution": "Esri World Imagery",
+  "lat": 35.6586,
+  "lon": 139.7454,
+  "zoom": 18,
+  "buffer": 500,
+  "bounds": {"min_lon": 139.74, "min_lat": 35.65, "max_lon": 139.75, "max_lat": 35.66},
+  "created_at": "2026-11-18T12:00:00+08:00",
+  "files": {"png": "current.png", "tif": "current.tif"}
+}
+```
+
+### 去重规则
+
+- 去重索引（MD5、dHash、中心瓦片预筛）仅在**同一数据源内**比较，同一地点用不同数据源下载会各自保留。
+- 扫描已有输出时，只纳入 `metadata.json` 中 `source` 与本次一致的文件。
+- 缺少 `metadata.json` 的旧输出按 `wayback` 处理，保持向后兼容。
+
+## 版权与使用限制
+
+- **ESRI Wayback / ESRI 当前影像**：影像版权归 Esri（World Imagery / Wayback），输出 `metadata.json` 保留归属文本。
+- **OpenStreetMap**：并发上限固定为 2，请勿批量高频抓取；使用或分发时需注明 **© OpenStreetMap contributors**，并遵守 OSM Tile Usage Policy。
+- **Bing**：影像版权归 Microsoft Bing Maps；批量下载前请自行确认 Bing Maps 服务条款与许可范围。
+- **Google Earth**：实验性数据源，接口可能随时失效，且使用受 Google 服务条款约束；批量下载前请自行确认许可。
+- 本项目仅提供下载工具，不授予任何影像的再分发权利，商用或公开发布前请自行核实各数据源条款。
 
 ## 系统要求
 
@@ -245,6 +332,6 @@ dist/TiffGetter.exe    # 约 83 MB，onefile 单文件
 
 ## 旧版本残余清理
 
-启动时 `WaybackImageFetcher.__init__` 会自动清理根目录下所有 `temp_tiles_*` 目录。
+启动时 `ImageFetcher.__init__` 会自动清理根目录下所有 `temp_tiles_*` 目录。
 
-也可在 GUI「清理与维护」Tab 手动扫描 temp_tiles + 历史日期子目录，勾选后二次确认批量删除。
+也可在 GUI「清理与维护」Tab 手动扫描 temp_tiles 与 `data/output` 下所有数据源的 release 目录（仅识别包含 `metadata.json` 或同名 PNG 的目录），勾选后二次确认批量删除。

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ESRI Wayback 历史影像获取工具 - CLI 入口
+"""TiffGetter 卫星影像获取工具 - CLI 入口
 
 两种模式：
 1) 单点模式（向后兼容）：--lat --lon
 2) 批量模式：--coords-file <CSV | SHP>
 
-参数：--zoom / --buffer / --output / --date-range / --coord-concurrency
+参数：--source / --zoom / --buffer / --output / --date-range / --coord-concurrency
 """
 import sys
 import logging
@@ -21,13 +21,16 @@ logging.basicConfig(
 
 sys.stdout.reconfigure(line_buffering=True)
 
-from satellite_processor import WaybackImageFetcher
+from providers.registry import (
+    DEFAULT_SOURCE, source_names, get_source, UnknownSourceError,
+)
+from satellite_processor import ImageFetcher
 from coordinate_loader import load_coordinates_file, CoordinateLoadError
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='获取坐标点的所有历史卫星影像 (ESRI Wayback)',
+        description='获取坐标点的卫星影像（支持多数据源）',
     )
     # 单点 / 批量 二选一：
     # - 单点：--lat 与 --lon 都必须提供（不在 argparse 强制，由 main() 检查）
@@ -40,13 +43,21 @@ def build_parser() -> argparse.ArgumentParser:
         help='批量坐标文件（.csv 或 .shp）；与 --lat/--lon 互斥',
     )
 
+    parser.add_argument(
+        '--source', type=str, choices=source_names(), default=DEFAULT_SOURCE,
+        help=('数据源（可选: ' + ', '.join(source_names())
+              + f'；默认: {DEFAULT_SOURCE}）'),
+    )
     parser.add_argument('--zoom', type=int, default=18, help='缩放级别 (默认: 18)')
-    parser.add_argument('--output', type=str, default='data/output/historical',
-                        help='输出目录（默认: data/output/historical）')
+    parser.add_argument(
+        '--output', type=str, default=None,
+        help=('输出目录（默认随数据源变化：wayback → data/output/historical，'
+              '其它 → data/output/<source>）'),
+    )
     parser.add_argument('--buffer', type=int, default=500,
                         help='缓冲区大小，米 (默认: 500)')
     parser.add_argument('--date-range', nargs=2, metavar=('START', 'END'),
-                        help='日期范围，如: 2020-01-01 2024-12-31')
+                        help='日期范围，如: 2020-01-01 2024-12-31（仅支持历史的数据源可用）')
     parser.add_argument('--coord-concurrency', type=int, default=1,
                         help='批量模式下坐标并发数（默认: 1）')
 
@@ -66,9 +77,33 @@ def _validate_common(args):
         sys.exit(2)
 
 
+def _resolve_output_dir(args) -> str:
+    if args.output is not None:
+        return args.output
+    if args.source == 'wayback':
+        return 'data/output/historical'
+    return f'data/output/{args.source}'
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    # 数据源解析（argparse choices 通常已拦截，这里保留防御）
+    try:
+        info = get_source(args.source).info
+    except UnknownSourceError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        print(f"可选数据源: {', '.join(source_names())}", file=sys.stderr)
+        sys.exit(2)
+
+    # 非历史数据源不允许日期范围
+    if args.date_range is not None and not info.supports_history:
+        print(
+            f"错误：数据源 {info.display_name} 不支持历史日期，--date-range 不可用",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # 互斥组：必须给出 (--lat + --lon) 或 --coords-file 之一
     if args.coords_file is None and (args.lat is None or args.lon is None):
@@ -80,9 +115,29 @@ def main():
 
     _validate_common(args)
 
+    # 按数据源缩放范围截断
+    if args.zoom > info.max_zoom:
+        logging.warning(
+            f"缩放级别 {args.zoom} 超过 {info.display_name} 上限 "
+            f"{info.max_zoom}，已截断为 {info.max_zoom}"
+        )
+        args.zoom = info.max_zoom
+    elif args.zoom < info.min_zoom:
+        logging.warning(
+            f"缩放级别 {args.zoom} 低于 {info.display_name} 下限 "
+            f"{info.min_zoom}，已截断为 {info.min_zoom}"
+        )
+        args.zoom = info.min_zoom
+
+    output_dir = _resolve_output_dir(args)
+
     print("=" * 60)
-    print("ESRI Wayback 历史影像获取工具")
+    print("TiffGetter 卫星影像获取工具")
     print("=" * 60)
+    print(f"数据源: {info.display_name} (source={info.name})")
+    print(f"版权: {info.attribution}")
+    if info.experimental:
+        print("实验性数据源，接口可能随时失效")
     if args.coords_file:
         print(f"模式: 批量")
         print(f"坐标文件: {args.coords_file}")
@@ -91,7 +146,7 @@ def main():
         print(f"模式: 单点")
         print(f"坐标: ({args.lat}, {args.lon})")
     print(f"缩放级别: {args.zoom}")
-    print(f"输出目录: {args.output}")
+    print(f"输出目录: {output_dir}")
     print(f"缓冲区: {args.buffer} 米")
     if date_range:
         print(f"日期范围: {date_range[0]} ~ {date_range[1]}")
@@ -106,7 +161,7 @@ def main():
             print(f"错误：lon 越界 {args.lon}，需 ∈ [-180, 180]", file=sys.stderr)
             sys.exit(2)
 
-    fetcher = WaybackImageFetcher()
+    fetcher = ImageFetcher(source=args.source)
 
     if args.coords_file:
         # 批量模式
@@ -117,9 +172,9 @@ def main():
                   file=sys.stderr)
             sys.exit(2)
         print(f"解析到 {len(coords)} 个坐标点")
-        summary = fetcher.fetch_batch_historical(
+        summary = fetcher.fetch_batch(
             coords=coords,
-            output_root=args.output,
+            output_root=output_dir,
             zoom=args.zoom,
             buffer_size=args.buffer,
             date_range=date_range,
@@ -128,6 +183,7 @@ def main():
 
         # 打印批量摘要
         print("\n批量结果摘要:")
+        print(f"数据源: {info.display_name} (source={info.name})")
         total_success = 0
         total_failed = 0
         all_zero = True
@@ -151,11 +207,11 @@ def main():
         sys.exit(0)
     else:
         # 单点模式
-        results = fetcher.fetch_all_historical(
+        results = fetcher.fetch_all(
             lat=args.lat,
             lon=args.lon,
             zoom=args.zoom,
-            output_dir=args.output,
+            output_dir=output_dir,
             buffer_size=args.buffer,
             date_range=date_range,
         )

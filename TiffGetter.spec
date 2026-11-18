@@ -98,6 +98,13 @@ else:
 # 隐式导入（PyInstaller 静态分析无法发现的模块）
 # ---------------------------------------------------------------------------
 hiddenimports = [
+    # 数据源实现：registry 通过 importlib 字符串映射动态导入，静态分析无法发现
+    'providers.wayback',
+    'providers.esri_current',
+    'providers.bing',
+    'providers.osm',
+    'providers.google_earth',
+    'providers.google_earth_client',
     # rasterio 子模块：动态导入，静态分析遗漏
     'rasterio.sample',
     'rasterio.vrt',

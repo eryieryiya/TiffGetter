@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ESRI Wayback 历史影像获取工具 - GUI
+"""TiffGetter 卫星影像获取工具 - GUI
 
 使用 ttkbootstrap 美化；三 Tab 设计：
   - Tab 1 单点下载（含地图选点）
@@ -45,6 +45,7 @@ except ImportError:
     HAS_MAPVIEW = False
 
 from utils.cleanup import scan_residuals, cleanup_temp_tiles, delete_paths, format_size
+from providers.registry import list_sources, get_source, DEFAULT_SOURCE
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -142,7 +143,21 @@ class App:
         self.auto_scroll_var = tk.BooleanVar(value=True)
         self._estimated_total_dates: Optional[int] = None  # 精细化进度
 
-        root.title("ESRI Wayback 历史影像获取")
+        # ----- 数据源状态（单点 / 批量共用同一个选择） -----
+        self._source_infos = list_sources()
+        self._sources_by_name = {s.name: s for s in self._source_infos}
+        self._source_name_by_display = {
+            s.display_name: s.name for s in self._source_infos
+        }
+        self.source_var = tk.StringVar(
+            value=self._sources_by_name[DEFAULT_SOURCE].display_name
+        )
+        # 输出目录是否被用户手动修改（区分自动跟随数据源）
+        self._output_programmatic = False
+        self._output_edited = False
+        self._batch_output_edited = False
+
+        root.title("TiffGetter 卫星影像获取")
         root.geometry("960x720")
         root.minsize(820, 600)
 
@@ -363,7 +378,7 @@ class App:
         title_col = ttk.Frame(header)
         title_col.pack(side=tk.LEFT, fill=tk.Y)
         ttk.Label(
-            title_col, text="ESRI Wayback 历史影像获取",
+            title_col, text="TiffGetter 卫星影像获取",
             font=('Segoe UI', 16, 'bold'),
         ).pack(anchor=tk.W)
         sub_text = "批量 · 坐标解析 · GeoTIFF 导出"
@@ -377,6 +392,21 @@ class App:
 
         # 分隔线
         ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        # ---------- 数据源选择（单点 / 批量共用） ----------
+        source_bar = ttk.Frame(self.root, padding=(12, 4))
+        source_bar.pack(fill=tk.X)
+        ttk.Label(source_bar, text="数据源:").pack(side=tk.LEFT)
+        self.source_combo = ttk.Combobox(
+            source_bar, textvariable=self.source_var, state='readonly',
+            values=[s.display_name for s in self._source_infos], width=26,
+        )
+        self.source_combo.pack(side=tk.LEFT, padx=(4, 12))
+        self.source_combo.bind('<<ComboboxSelected>>', self._on_source_changed)
+        self.attribution_lbl = self._lbl(source_bar, text="", style=SECONDARY)
+        self.attribution_lbl.pack(side=tk.LEFT, padx=(0, 10))
+        self.experimental_lbl = self._lbl(source_bar, text="", style=WARNING)
+        self.experimental_lbl.pack(side=tk.LEFT)
 
         # 主 Notebook
         self.notebook = ttk.Notebook(self.root)
@@ -481,6 +511,118 @@ class App:
             style=outline_style, padding=(8, 2), relief=tk.SUNKEN,
         )
         self.theme_status_lbl.pack(side=tk.RIGHT)
+        # 右侧数据源标签
+        self.source_status_lbl = self._lbl(
+            status_frame, text="", style=outline_style,
+            padding=(8, 2), relief=tk.SUNKEN,
+        )
+        self.source_status_lbl.pack(side=tk.RIGHT, padx=(0, 4))
+
+        # 按初始数据源应用一次联动
+        self._apply_source(self._current_source_name())
+
+    # ------------------------------------------------------------------
+    # 数据源联动
+    # ------------------------------------------------------------------
+    def _current_source_name(self) -> str:
+        return self._source_name_by_display.get(
+            self.source_var.get(), DEFAULT_SOURCE
+        )
+
+    def _current_source_info(self):
+        name = self._current_source_name()
+        info = self._sources_by_name.get(name)
+        if info is None:
+            info = get_source(name).info
+        return info
+
+    def _on_source_changed(self, _event=None):
+        self._apply_source(self._current_source_name())
+
+    def _apply_source(self, name: str) -> None:
+        info = self._sources_by_name.get(name)
+        if info is None:
+            try:
+                info = get_source(name).info
+            except Exception:
+                info = self._sources_by_name[DEFAULT_SOURCE]
+        self.source_var.set(info.display_name)
+
+        # 1) 日期范围：非历史源禁用并清空
+        if info.supports_history:
+            self._set_date_widgets_state(True)
+        else:
+            self._set_date_widgets_state(False)
+            for var in (self.date_start_var, self.date_end_var,
+                        self.batch_date_start_var, self.batch_date_end_var):
+                var.set("")
+
+        # 2) 缩放范围随数据源更新，超限值截断
+        self._apply_zoom_limits(info)
+
+        # 3) 输出目录：用户未手动修改时跟随数据源
+        if not self._output_edited:
+            self._set_output_value(
+                self.output_var, self._default_output_for(info.name, batch=False)
+            )
+        if not self._batch_output_edited:
+            self._set_output_value(
+                self.batch_output_var,
+                self._default_output_for(info.name, batch=True),
+            )
+
+        # 4) 版权与实验性提示
+        self.attribution_lbl.configure(text=f"版权：{info.attribution}")
+        self.experimental_lbl.configure(
+            text="⚠ 实验性数据源，接口可能失效" if info.experimental else ""
+        )
+        self.source_status_lbl.configure(text=f"数据源：{info.display_name}")
+        self.log_msg(f"当前数据源: {info.display_name}（版权：{info.attribution}）")
+        if info.experimental:
+            self.log_msg("提示：该数据源为实验性，接口可能失效")
+
+    def _set_date_widgets_state(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for widget in (self.date_start_entry, self.date_end_entry,
+                       self.batch_date_start_entry, self.batch_date_end_entry):
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+
+    def _apply_zoom_limits(self, info) -> None:
+        for spin, var in ((self.zoom_spin, self.zoom_var),
+                          (self.batch_zoom_spin, self.batch_zoom_var)):
+            try:
+                spin.configure(from_=info.min_zoom, to=info.max_zoom)
+            except Exception:
+                pass
+            try:
+                value = var.get()
+            except Exception:
+                continue
+            clamped = min(max(value, info.min_zoom), info.max_zoom)
+            if clamped != value:
+                var.set(clamped)
+
+    @staticmethod
+    def _default_output_for(source_name: str, batch: bool = False) -> str:
+        if source_name == DEFAULT_SOURCE:
+            return os.path.join(
+                "data", "output", "batch" if batch else "historical"
+            )
+        return os.path.join("data", "output", source_name)
+
+    def _set_output_value(self, var: tk.StringVar, value: str) -> None:
+        self._output_programmatic = True
+        try:
+            var.set(value)
+        finally:
+            self._output_programmatic = False
+
+    def _mark_output_edited(self, flag_attr: str) -> None:
+        if not self._output_programmatic:
+            setattr(self, flag_attr, True)
 
     # ------------------------------------------------------------------
     # 主题切换器
@@ -658,7 +800,8 @@ class App:
 
         ttk.Label(param_frame, text="缩放级别:").grid(row=0, column=0, padx=(0, 4), pady=2, sticky=tk.W)
         self.zoom_var = tk.IntVar(value=18)
-        ttk.Spinbox(param_frame, from_=1, to=20, textvariable=self.zoom_var, width=18).grid(row=0, column=1, padx=(0, 8), pady=2, sticky=tk.W)
+        self.zoom_spin = ttk.Spinbox(param_frame, from_=1, to=20, textvariable=self.zoom_var, width=18)
+        self.zoom_spin.grid(row=0, column=1, padx=(0, 8), pady=2, sticky=tk.W)
 
         ttk.Label(param_frame, text="缓冲区 (米):").grid(row=0, column=2, padx=(0, 4), pady=2, sticky=tk.W)
         self.buffer_var = tk.IntVar(value=500)
@@ -673,11 +816,13 @@ class App:
 
         ttk.Label(date_frame, text="起始:").grid(row=0, column=0, padx=(0, 4), pady=2, sticky=tk.W)
         self.date_start_var = tk.StringVar()
-        self._date_entry(date_frame, self.date_start_var).grid(row=0, column=1, padx=(0, 8), pady=2, sticky=tk.EW)
+        self.date_start_entry = self._date_entry(date_frame, self.date_start_var)
+        self.date_start_entry.grid(row=0, column=1, padx=(0, 8), pady=2, sticky=tk.EW)
 
         ttk.Label(date_frame, text="截止:").grid(row=0, column=2, padx=(0, 4), pady=2, sticky=tk.W)
         self.date_end_var = tk.StringVar()
-        self._date_entry(date_frame, self.date_end_var).grid(row=0, column=3, pady=2, sticky=tk.EW)
+        self.date_end_entry = self._date_entry(date_frame, self.date_end_var)
+        self.date_end_entry.grid(row=0, column=3, pady=2, sticky=tk.EW)
 
         # 输出
         out_frame = ttk.LabelFrame(parent, text="输出设置", padding=10)
@@ -686,6 +831,9 @@ class App:
 
         ttk.Label(out_frame, text="输出目录:").grid(row=0, column=0, padx=(0, 4), pady=2, sticky=tk.W)
         self.output_var = tk.StringVar(value=os.path.join("data", "output", "historical"))
+        self.output_var.trace_add(
+            'write', lambda *_: self._mark_output_edited('_output_edited')
+        )
         ttk.Entry(out_frame, textvariable=self.output_var, width=50).grid(row=0, column=1, padx=(0, 4), pady=2, sticky=tk.EW)
         self._btn(out_frame, text="浏览", style=SECONDARY,
                   command=lambda: self.output_var.set(filedialog.askdirectory() or self.output_var.get())
@@ -733,7 +881,8 @@ class App:
 
         ttk.Label(param_frame, text="缩放级别:").grid(row=0, column=0, padx=(0, 4), pady=2, sticky=tk.W)
         self.batch_zoom_var = tk.IntVar(value=18)
-        ttk.Spinbox(param_frame, from_=1, to=20, textvariable=self.batch_zoom_var, width=18).grid(row=0, column=1, padx=(0, 8), pady=2, sticky=tk.W)
+        self.batch_zoom_spin = ttk.Spinbox(param_frame, from_=1, to=20, textvariable=self.batch_zoom_var, width=18)
+        self.batch_zoom_spin.grid(row=0, column=1, padx=(0, 8), pady=2, sticky=tk.W)
 
         ttk.Label(param_frame, text="缓冲区 (米):").grid(row=0, column=2, padx=(0, 4), pady=2, sticky=tk.W)
         self.batch_buffer_var = tk.IntVar(value=500)
@@ -742,17 +891,22 @@ class App:
 
         ttk.Label(param_frame, text="起始:").grid(row=1, column=0, padx=(0, 4), pady=2, sticky=tk.W)
         self.batch_date_start_var = tk.StringVar()
-        self._date_entry(param_frame, self.batch_date_start_var).grid(row=1, column=1, padx=(0, 8), pady=2, sticky=tk.EW)
+        self.batch_date_start_entry = self._date_entry(param_frame, self.batch_date_start_var)
+        self.batch_date_start_entry.grid(row=1, column=1, padx=(0, 8), pady=2, sticky=tk.EW)
 
         ttk.Label(param_frame, text="截止:").grid(row=1, column=2, padx=(0, 4), pady=2, sticky=tk.W)
         self.batch_date_end_var = tk.StringVar()
-        self._date_entry(param_frame, self.batch_date_end_var).grid(row=1, column=3, pady=2, sticky=tk.EW)
+        self.batch_date_end_entry = self._date_entry(param_frame, self.batch_date_end_var)
+        self.batch_date_end_entry.grid(row=1, column=3, pady=2, sticky=tk.EW)
 
         out2 = ttk.Frame(param_frame)
         out2.grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=(6, 0))
         out2.columnconfigure(1, weight=1)
         ttk.Label(out2, text="输出根目录:").grid(row=0, column=0, padx=(0, 4), pady=2, sticky=tk.W)
         self.batch_output_var = tk.StringVar(value=os.path.join("data", "output", "batch"))
+        self.batch_output_var.trace_add(
+            'write', lambda *_: self._mark_output_edited('_batch_output_edited')
+        )
         ttk.Entry(out2, textvariable=self.batch_output_var, width=50).grid(row=0, column=1, padx=(0, 4), pady=2, sticky=tk.EW)
         self._btn(out2, text="浏览", style=SECONDARY,
                   command=lambda: self.batch_output_var.set(filedialog.askdirectory() or self.batch_output_var.get())
@@ -770,7 +924,7 @@ class App:
         self.preview_tree.heading("name", text="名称 / ID")
         self.preview_tree.heading("lat", text="纬度")
         self.preview_tree.heading("lon", text="经度")
-        self.preview_tree.heading("source", text="来源")
+        self.preview_tree.heading("source", text="坐标来源")
         self.preview_tree.column("name", width=200, anchor=tk.W)
         self.preview_tree.column("lat", width=120, anchor=tk.E)
         self.preview_tree.column("lon", width=120, anchor=tk.E)
@@ -1357,10 +1511,12 @@ class App:
         self.log.delete(1.0, tk.END)
         self.status_var.set("运行中...")
 
-        cmd = _build_cli_cmd(["--lat", str(lat), "--lon", str(lon),
+        info = self._current_source_info()
+        cmd = _build_cli_cmd(["--source", info.name,
+                              "--lat", str(lat), "--lon", str(lon),
                               "--zoom", str(zoom), "--buffer", str(buf),
                               "--output", out])
-        if ds and de:
+        if info.supports_history and ds and de:
             cmd.extend(["--date-range", ds, de])
 
         self._launch_subprocess(cmd)
@@ -1378,11 +1534,13 @@ class App:
         self.log.delete(1.0, tk.END)
         self.status_var.set("批量下载中...")
 
-        cmd = _build_cli_cmd(["--coords-file", path,
+        info = self._current_source_info()
+        cmd = _build_cli_cmd(["--source", info.name,
+                              "--coords-file", path,
                               "--zoom", str(zoom), "--buffer", str(buf),
                               "--output", out,
                               "--coord-concurrency", str(conc)])
-        if ds and de:
+        if info.supports_history and ds and de:
             cmd.extend(["--date-range", ds, de])
 
         self._launch_subprocess(cmd)

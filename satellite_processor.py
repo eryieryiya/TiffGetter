@@ -1,14 +1,16 @@
-# ESRI Wayback 历史影像获取模块
+# 多数据源影像获取模块（默认 ESRI Wayback）
 import os
 import time
-import requests
+import json
 import concurrent.futures
 import math
 import shutil
+import tempfile
 import logging
 import hashlib
 import re
 import urllib3
+from datetime import datetime
 from PIL import Image
 from typing import List, Dict, Tuple, Optional
 import numpy as np
@@ -48,61 +50,30 @@ if not logger.handlers and not logging.getLogger().handlers:
     logger.propagate = False
 
 from config import WGS84_WKT, THREAD_POOL_SIZE
+from providers.registry import DEFAULT_SOURCE, get_source
 
 # 自定义异常：瓦片未下载完整
 class IncompleteTilesError(Exception):
     pass
 
 
-# ESRI Wayback 版本列表（fallback 用，仅当在线 endpoint 完全不可用时的最后兜底）
-# 仅保留最近确认的 5 条 ID；在线路径优先。
-KNOWN_WAYBACK_VERSIONS = [
-    {"id": "20512", "date": "2026-05-28"},
-    {"id": "32553", "date": "2024-08-15"},
-    {"id": "64776", "date": "2023-08-31"},
-    {"id": "296", "date": "2023-02-23"},
-    {"id": "273", "date": "2023-01-27"},
-]
-
-
-class WaybackImageFetcher:
-    # ESRI 在线 wayback 服务元数据 endpoint（实测确认）
-    # 响应 JSON 含 "Selection" 列表：{"Name": "World Imagery (Wayback YYYY-MM-DD)",
-    #                                  "M": "26334", "ID": "WB_2026_R07"}
-    WAYBACK_METADATA_URL = (
-        "https://wayback.maptiles.arcgis.com/arcgis/rest/services/"
-        "world_imagery/MapServer?f=json"
-    )
-    # 瓦片 URL 主模板（实测可用，wayback_id 即 Selection[].M）
-    WAYBACK_TILE_URL_TEMPLATE = (
-        "https://wayback.maptiles.arcgis.com/arcgis/rest/services/"
-        "world_imagery/MapServer/tile/{wayback_id}/{z}/{y}/{x}"
-    )
-    # 备用 WMTS 模板（wayback-a 子域名，实测同样返回内容）
-    WAYBACK_TILE_URL_FALLBACK = (
-        "https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/"
-        "world_imagery/wmts/1.0.0/default028mm/mapserver/tile/"
-        "{wayback_id}/{z}/{y}/{x}"
-    )
-
-    def __init__(self):
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=20,
-            max_retries=requests.packages.urllib3.util.retry.Retry(
-                total=3, backoff_factor=0.5
-            )
+class ImageFetcher:
+    def __init__(self, source: str = DEFAULT_SOURCE):
+        self.source = get_source(source)
+        self.info = self.source.info
+        # 线程池大小来自 config，并受数据源并发上限约束
+        self.thread_pool_size = min(
+            THREAD_POOL_SIZE or 10, self.info.max_concurrency
         )
-        self.session = requests.Session()
-        self.session.mount('https://', adapter)
-        self.session.verify = False
-        # 线程池大小来自 config；fallback 为 10（与 config.py 中默认值一致）
-        self.thread_pool_size = THREAD_POOL_SIZE or 10
         self._downloaded_hashes = set()         # 字节级 MD5：100% 精确重复
         self._downloaded_dhashes: set = set()   # 感知级 dHash(int)：视觉重复
         self._probe_tile_dhashes: Dict[str, int] = {}  # 预筛：(坐标zoom -> release_id -> tile dhash)
         self._diag_done: set = set()            # zoom×buffer 诊断节流：(zoom,lat1,lon1,buf)
-        self._wayback_tile_url_template = self.WAYBACK_TILE_URL_TEMPLATE
+
+        if self.info.experimental:
+            logger.warning(
+                f"{self.info.display_name} 为实验性数据源，接口可能随时失效"
+            )
 
         # 启动时自动清理根目录残留的 temp_tiles_*/ 临时瓦片目录
         self._cleanup_residual_temp_tiles()
@@ -347,63 +318,8 @@ class WaybackImageFetcher:
         return new_bounds, (px_left, px_top, px_right, px_bottom), True
 
     # ------------------------------------------------------------------
-    # ESRI 在线 release 列表
+    # 数据源 release 列表
     # ------------------------------------------------------------------
-    def _fetch_wayback_releases(self) -> Optional[List[Dict]]:
-        """从 ESRI 官方 endpoint 动态获取 wayback release 列表。
-
-        Endpoint: GET WAYBACK_METADATA_URL（world_imagery/MapServer?f=json）
-        响应 JSON 结构（实测确认）：
-            {"Service": "Wayback", "Selection": [ ... ]}
-        其中 Selection 为 release 列表（按日期降序，最新在前），每项形如：
-            {"Name": "World Imagery (Wayback 2026-08-05)",
-             "M": "26334",
-             "ID": "WB_2026_R07"}
-        - M   : 瓦片 URL 中使用的数字 ID（即 wayback_id）
-        - Name: 展示名，其中含发布日期 "Wayback YYYY-MM-DD"
-        - ID  : 发布代号（如 WB_2026_R07）
-
-        网络不可达 / 解析失败时返回 None，调用方回退到 KNOWN_WAYBACK_VERSIONS。
-        """
-        try:
-            resp = self.session.get(self.WAYBACK_METADATA_URL, timeout=15)
-            if resp.status_code != 200:
-                logger.warning(f"wayback 元数据返回 HTTP {resp.status_code}")
-                return None
-            data = resp.json()
-        except Exception as e:
-            logger.warning(f"无法获取 wayback 元数据: {e}")
-            return None
-
-        selection = data.get('Selection')
-        if not isinstance(selection, list) or not selection:
-            logger.warning("wayback 元数据缺少 Selection 列表，无法解析 release")
-            return None
-
-        # Name 形如 "World Imagery (Wayback 2026-08-05)"
-        date_pattern = re.compile(r'Wayback[ \(](\d{4}-\d{2}-\d{2})\)')
-        releases = []
-        for item in selection:
-            name = str(item.get('Name', ''))
-            m_id = str(item.get('M', '')).strip()
-            if not m_id:
-                continue
-            m = date_pattern.search(name)
-            date_str = m.group(1) if m else '1970-01-01'
-            releases.append({
-                'id': m_id,
-                'date': date_str,
-                'name': name,
-                'release_id': str(item.get('ID', '')),
-                'source': 'wayback-online',
-            })
-
-        if not releases:
-            logger.warning("wayback Selection 中未解析出任何 release id")
-            return None
-
-        return releases
-
     def get_available_dates(self, lat: float, lon: float, zoom: int = 18) -> List[Dict]:
         # 入参校验
         if not (-90.0 <= lat <= 90.0):
@@ -413,72 +329,38 @@ class WaybackImageFetcher:
         if not (1 <= zoom <= 20):
             raise ValueError(f"zoom 越界: {zoom}")
 
-        logger.info(f"查询坐标 ({lat:.6f}, {lon:.6f}) 的可用历史影像...")
-
-        # 在线列表优先
-        online = self._fetch_wayback_releases()
-        if online:
-            logger.info(f"在线元数据返回 {len(online)} 个 release")
-            result = online
-        else:
-            logger.warning("在线元数据不可用，回退到 KNOWN_WAYBACK_VERSIONS")
-            result = [
-                {'id': v['id'], 'date': v['date'], 'name': v['date'], 'source': 'wayback'}
-                for v in KNOWN_WAYBACK_VERSIONS
-            ]
-
-        # 统一按日期升序（最早的在前），使输出子文件夹按时间线排列
-        result.sort(key=lambda d: d['date'])
-
+        logger.info(
+            f"查询坐标 ({lat:.6f}, {lon:.6f}) 的 "
+            f"{self.info.display_name} 可用版本..."
+        )
+        result = self.source.available_releases(lat, lon, zoom)
         logger.info(f"找到 {len(result)} 个版本")
         return result
 
     # ------------------------------------------------------------------
     # 瓦片下载
     # ------------------------------------------------------------------
-    def _resolve_tile_url(self, wayback_id: str, z: int, y: int, x: int) -> str:
-        """构造瓦片 URL。优先用动态模板，失败时使用 fallback 模板。"""
-        template = self._wayback_tile_url_template or self.WAYBACK_TILE_URL_FALLBACK
-        try:
-            return template.format(wayback_id=wayback_id, z=z, y=y, x=x)
-        except KeyError:
-            return self.WAYBACK_TILE_URL_FALLBACK.format(
-                wayback_id=wayback_id, z=z, y=y, x=x
-            )
-
     def download_tiles_batch(self, tile_coords: List[Tuple[int, int]], zoom: int,
-                             temp_dir: str, wayback_id: str = None) -> int:
+                             temp_dir: str, release: Dict) -> int:
         """并发下载瓦片，返回成功下载数（包含本地已缓存的）。"""
         downloaded = [0]
-        headers = {'User-Agent': 'Mozilla/5.0'}
 
         def download_one(x, y, z, save_path):
             try:
-                if wayback_id:
-                    url = self._resolve_tile_url(wayback_id, z, y, x)
-                else:
-                    url = (
-                        f"https://server.arcgisonline.com/arcgis/rest/services/"
-                        f"World_Imagery/MapServer/tile/{z}/{y}/{x}"
-                    )
-                resp = self.session.get(url, headers=headers, timeout=60)
-                if resp.status_code == 200 and len(resp.content) > 1000:
+                content = self.source.fetch_tile(z, x, y, release)
+                if content is not None:
                     with open(save_path, 'wb') as f:
-                        f.write(resp.content)
+                        f.write(content)
                     downloaded[0] += 1
-                else:
-                    # 失败时清理半成品文件
-                    if os.path.exists(save_path):
-                        try:
-                            os.remove(save_path)
-                        except OSError:
-                            pass
+                    return
             except Exception:
-                if os.path.exists(save_path):
-                    try:
-                        os.remove(save_path)
-                    except OSError:
-                        pass
+                pass
+            # 失败时清理半成品文件
+            if os.path.exists(save_path):
+                try:
+                    os.remove(save_path)
+                except OSError:
+                    pass
 
         tasks = []
         for x, y in tile_coords:
@@ -656,35 +538,31 @@ class WaybackImageFetcher:
     @staticmethod
     def _hamming(a: Optional[int], b: Optional[int]) -> int:
         if a is None or b is None:
-            return (WaybackImageFetcher.DHASH_SIZE *
-                    WaybackImageFetcher.DHASH_SIZE)  # 最坏距离，永不判重
+            return (ImageFetcher.DHASH_SIZE *
+                    ImageFetcher.DHASH_SIZE)  # 最坏距离，永不判重
         return bin(a ^ b).count('1')
 
     def _fetch_center_tile_dhash(self, lat: float, lon: float, zoom: int,
-                                 wayback_id: str, temp_root: str) -> Optional[int]:
-        """为指定坐标 + wayback 版本，预下载 1 张「覆盖中心点」的瓦片，返回其 dHash。
+                                 release: Dict, temp_root: str) -> Optional[int]:
+        """为指定坐标 + release，预下载 1 张「覆盖中心点」的瓦片，返回其 dHash。
 
         作为 1-tile / ~50KB 量级的预筛；比下完几 MB 整片再发现重复，
         能节省 90%+ 的网络开销。失败返回 None，调用方应放弃预筛。
         """
         try:
+            release_id = str(release.get('id', 'unknown')).replace('/', '_')
             x, y = self._center_tile(lat, lon, zoom)
-            tmp_dir = os.path.join(temp_root, f"probe_{wayback_id}")
+            tmp_dir = os.path.join(temp_root, f"probe_{release_id}")
             os.makedirs(tmp_dir, exist_ok=True)
             save_path = os.path.join(tmp_dir, f"{x}_{y}.png")
             if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
                 pass  # 复用之前探针
             else:
-                url = self._resolve_tile_url(wayback_id, zoom, y, x)
-                headers = {'User-Agent': 'Mozilla/5.0'}
-                try:
-                    resp = self.session.get(url, headers=headers, timeout=30)
-                    if resp.status_code != 200 or len(resp.content) <= 1000:
-                        return None
-                    with open(save_path, 'wb') as f:
-                        f.write(resp.content)
-                except Exception:
+                content = self.source.fetch_tile(zoom, x, y, release)
+                if content is None:
                     return None
+                with open(save_path, 'wb') as f:
+                    f.write(content)
             with Image.open(save_path) as im:
                 return self.compute_dhash_int(im)
         except Exception:
@@ -745,7 +623,7 @@ class WaybackImageFetcher:
                   便于用户一眼核对「级别」与「缓冲距离」是否按预期传递。
         """
         date_str = date_info['date']
-        wayback_id = date_info['id']
+        release_id = str(date_info.get('id', ''))
 
         x_min, x_max, y_min, y_max = self.get_tile_coords(lat, lon, zoom, buffer_size)
         expected_tile_count = (x_max - x_min + 1) * (y_max - y_min + 1)
@@ -757,8 +635,8 @@ class WaybackImageFetcher:
         ns_m = (max_lat - min_lat) * 111320.0
 
         logger.info(
-            f"下载 {date_str} (ID: {wayback_id}) "
-            f"[zoom={zoom}, buffer={buffer_size}m, "
+            f"下载 {date_str} (ID: {release_id}) "
+            f"[{self.info.display_name}, zoom={zoom}, buffer={buffer_size}m, "
             f"瓦片 {x_max-x_min+1}×{y_max-y_min+1}={expected_tile_count}, "
             f"地面覆盖 ~ {ew_m:.0f}m × {ns_m:.0f}m]"
         )
@@ -766,7 +644,7 @@ class WaybackImageFetcher:
         # ---------- 0) 预筛：1 张中心瓦片 dHash 短路（避免整片区下载） ----------
         if probe_root:
             tile_dhash = self._fetch_center_tile_dhash(
-                lat, lon, zoom, wayback_id, probe_root,
+                lat, lon, zoom, date_info, probe_root,
             )
             if tile_dhash is not None and self._probe_tile_dhashes:
                 for known in self._probe_tile_dhashes.values():
@@ -775,7 +653,7 @@ class WaybackImageFetcher:
                             f"[预筛-中心瓦片] {date_str} 与已收录版本视觉相同，"
                             f"跳过 (dHash 距离 {self._hamming(tile_dhash, known)})"
                         )
-                        self._probe_tile_dhashes.setdefault(wayback_id, tile_dhash)
+                        self._probe_tile_dhashes.setdefault(release_id, tile_dhash)
                         return {
                             'status': 'duplicate',
                             'date': date_str,
@@ -783,21 +661,13 @@ class WaybackImageFetcher:
                             'reason': 'precheck-tile-dhash',
                         }
             if tile_dhash is not None:
-                self._probe_tile_dhashes.setdefault(wayback_id, tile_dhash)
+                self._probe_tile_dhashes.setdefault(release_id, tile_dhash)
 
-        temp_dir = f"temp_tiles_{date_str.replace('-', '')}"
-        for _ in range(3):
-            try:
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                break
-            except PermissionError:
-                time.sleep(0.5)
-        os.makedirs(temp_dir, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix=f"temp_tiles_{self.info.name}_{date_str.replace('-', '')[:10]}_", dir=os.getcwd())
 
         tile_coords = [(x, y) for x in range(x_min, x_max + 1)
                       for y in range(y_min, y_max + 1)]
-        downloaded = self.download_tiles_batch(tile_coords, zoom, temp_dir, wayback_id)
+        downloaded = self.download_tiles_batch(tile_coords, zoom, temp_dir, date_info)
 
         if downloaded == 0:
             logger.error(f"瓦片下载失败: {date_str}")
@@ -894,6 +764,10 @@ class WaybackImageFetcher:
             if img_dhash is not None:
                 self._downloaded_dhashes.add(img_dhash)
             shutil.rmtree(temp_dir, ignore_errors=True)
+            self._write_metadata(
+                date_dir, date_info, lat, lon, zoom, buffer_size, bounds,
+                os.path.basename(png_path), os.path.basename(tif_path),
+            )
             logger.info(
                 f"成功: {tif_path} "
                 f"[最终覆盖 {out_ew_m:.0f}m(EW) × {out_ns_m:.0f}m(NS)]"
@@ -916,6 +790,10 @@ class WaybackImageFetcher:
             if img_dhash is not None:
                 self._downloaded_dhashes.add(img_dhash)
             shutil.rmtree(temp_dir, ignore_errors=True)
+            self._write_metadata(
+                date_dir, date_info, lat, lon, zoom, buffer_size, bounds,
+                os.path.basename(png_path), None,
+            )
             logger.info(
                 f"成功（仅 PNG）: {png_path} "
                 f"[最终覆盖 {out_ew_m:.0f}m(EW) × {out_ns_m:.0f}m(NS)]"
@@ -928,15 +806,55 @@ class WaybackImageFetcher:
                 'path': png_path
             }
 
+    def _write_metadata(self, date_dir: str, release: Dict, lat: float, lon: float,
+                        zoom: int, buffer_size: int, bounds: Dict,
+                        png_name: str, tif_name: Optional[str]) -> None:
+        """在 release 输出目录写入 metadata.json。"""
+        metadata = {
+            'source': self.info.name,
+            'release_id': release.get('id'),
+            'release_date': release.get('date'),
+            'attribution': release.get('attribution') or self.info.attribution,
+            'lat': lat,
+            'lon': lon,
+            'zoom': zoom,
+            'buffer': buffer_size,
+            'bounds': bounds,
+            'created_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'files': {'png': png_name, 'tif': tif_name},
+        }
+        try:
+            with open(os.path.join(date_dir, 'metadata.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            logger.warning(f"写入 metadata.json 失败: {e}")
+
+    @staticmethod
+    def _read_metadata_source(date_dir: str) -> str:
+        """读取 release 目录的数据源；缺少/损坏 metadata 时按 wayback 处理。"""
+        meta_path = os.path.join(date_dir, 'metadata.json')
+        if not os.path.exists(meta_path):
+            return 'wayback'
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return str(data.get('source') or 'wayback')
+        except Exception as e:
+            logger.warning(f"读取 {meta_path} 失败，按 wayback 处理: {e}")
+            return 'wayback'
+
     # ------------------------------------------------------------------
     # 批量入口
     # ------------------------------------------------------------------
-    def fetch_all_historical(self, lat: float, lon: float, zoom: int = 18,
-                             output_dir: str = 'data/output/historical',
-                             buffer_size: int = 500,
-                             date_range: Optional[Tuple[str, str]] = None) -> List[Dict]:
+    def fetch_all(self, lat: float, lon: float, zoom: int = 18,
+                  output_dir: str = 'data/output/historical',
+                  buffer_size: int = 500,
+                  date_range: Optional[Tuple[str, str]] = None) -> List[Dict]:
         logger.info("=" * 60)
-        logger.info(f"获取坐标 ({lat:.6f}, {lon:.6f}) 的历史影像")
+        logger.info(
+            f"获取坐标 ({lat:.6f}, {lon:.6f}) 的 {self.info.display_name} 影像"
+        )
         logger.info("=" * 60)
 
         # 清空已下载哈希记录（双重：MD5 + dHash）
@@ -954,11 +872,14 @@ class WaybackImageFetcher:
         except Exception:
             probe_root = None  # 建目录失败就放弃预筛，不影响主流程
 
-        # ---------- 预填充：扫描已有 PNG 同时建 MD5 + dHash 两条索引 ----------
+        # ---------- 预填充：仅扫描同源文件，建 MD5 + dHash 两条索引 ----------
         if os.path.exists(output_dir):
             for date_dir in sorted(os.listdir(output_dir)):
-                png_path = os.path.join(output_dir, date_dir, f'{date_dir}.png')
-                if not os.path.exists(png_path):
+                date_dir_path = os.path.join(output_dir, date_dir)
+                png_path = os.path.join(date_dir_path, f'{date_dir}.png')
+                if not os.path.isdir(date_dir_path) or not os.path.exists(png_path):
+                    continue
+                if self._read_metadata_source(date_dir_path) != self.info.name:
                     continue
                 img_md5 = self.compute_image_hash(png_path)
                 img_dhash = self.compute_dhash_int_from_path(png_path)
@@ -986,8 +907,9 @@ class WaybackImageFetcher:
             png_path = os.path.join(date_dir, f'{date_str}.png')
             tif_path = os.path.join(date_dir, f'{date_str}.tif')
 
-            # ---------- 已有文件：去重 or 直接跳过 ----------
-            if os.path.exists(png_path):
+            # ---------- 已有文件：去重 or 直接跳过（仅限同源） ----------
+            if os.path.exists(png_path) and \
+                    self._read_metadata_source(date_dir) == self.info.name:
                 is_dup, img_md5, img_dhash = self._is_duplicate_image(
                     png_path,
                     byte_hashes=self._downloaded_hashes,
@@ -1068,19 +990,19 @@ class WaybackImageFetcher:
     # ------------------------------------------------------------------
     # 批量入口（多坐标）
     # ------------------------------------------------------------------
-    def fetch_batch_historical(self, coords: List[Dict],
-                               output_root: str,
-                               zoom: int = 18,
-                               buffer_size: int = 500,
-                               date_range: Optional[Tuple[str, str]] = None,
-                               coord_concurrency: int = 1) -> List[Dict]:
-        """批量获取多坐标点的历史影像。
+    def fetch_batch(self, coords: List[Dict],
+                    output_root: str,
+                    zoom: int = 18,
+                    buffer_size: int = 500,
+                    date_range: Optional[Tuple[str, str]] = None,
+                    coord_concurrency: int = 1) -> List[Dict]:
+        """批量获取多坐标点的影像。
 
         Args:
             coords: 由 coordinate_loader.load_coordinates_file 返回的坐标列表，
                     每项必须含 lat, lon；name, id 可选。
             output_root: 批量输出根目录；每个坐标点一个独立子目录。
-            zoom, buffer_size, date_range: 同 fetch_all_historical。
+            zoom, buffer_size, date_range: 同 fetch_all。
             coord_concurrency: 坐标级别并发数；默认 1（串行，避免 ESRI 限流）。
 
         Returns:
@@ -1116,7 +1038,7 @@ class WaybackImageFetcher:
             logger.info("=" * 60)
 
             try:
-                results = self.fetch_all_historical(
+                results = self.fetch_all(
                     lat=lat,
                     lon=lon,
                     zoom=zoom,
