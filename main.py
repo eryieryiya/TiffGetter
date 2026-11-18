@@ -60,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help='日期范围，如: 2020-01-01 2024-12-31（仅支持历史的数据源可用）')
     parser.add_argument('--coord-concurrency', type=int, default=1,
                         help='批量模式下坐标并发数（默认: 1）')
+    parser.add_argument('--no-dedup', action='store_true',
+                        help='关闭重复检测，每个历史日期都单独输出')
 
     return parser
 
@@ -138,6 +140,10 @@ def main():
     print(f"版权: {info.attribution}")
     if info.experimental:
         print("实验性数据源，接口可能随时失效")
+    if info.supports_history:
+        print("版本能力: 支持历史版本")
+    else:
+        print("版本能力: 仅当前影像（数据源本身无历史存档）")
     if args.coords_file:
         print(f"模式: 批量")
         print(f"坐标文件: {args.coords_file}")
@@ -161,7 +167,7 @@ def main():
             print(f"错误：lon 越界 {args.lon}，需 ∈ [-180, 180]", file=sys.stderr)
             sys.exit(2)
 
-    fetcher = ImageFetcher(source=args.source)
+    fetcher = ImageFetcher(source=args.source, dedup=not args.no_dedup)
 
     if args.coords_file:
         # 批量模式

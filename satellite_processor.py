@@ -58,9 +58,10 @@ class IncompleteTilesError(Exception):
 
 
 class ImageFetcher:
-    def __init__(self, source: str = DEFAULT_SOURCE):
+    def __init__(self, source: str = DEFAULT_SOURCE, dedup: bool = True):
         self.source = get_source(source)
         self.info = self.source.info
+        self.dedup = dedup
         # 线程池大小来自 config，并受数据源并发上限约束
         self.thread_pool_size = min(
             THREAD_POOL_SIZE or 10, self.info.max_concurrency
@@ -613,11 +614,14 @@ class ImageFetcher:
     def download_image(self, lat: float, lon: float, zoom: int,
                        date_info: Dict, output_dir: str,
                        buffer_size: int = 500,
-                       probe_root: Optional[str] = None) -> Optional[Dict]:
+                       probe_root: Optional[str] = None,
+                       dedup: bool = True) -> Optional[Dict]:
         """下载单日期版本影像。
 
         probe_root: 若指定，先下载中心瓦片做 dHash 预筛；命中直接跳过，
                     可节省 90%+ 重复发布的网络/CPU。为 None 则跳过预筛。
+        dedup: 是否启用重复检测；False 时跳过中心瓦片预筛与整图去重，
+               每个日期都完整下载并输出。
 
         显式参数：lat / lon / zoom / buffer_size 会在此行同时打印，
                   便于用户一眼核对「级别」与「缓冲距离」是否按预期传递。
@@ -642,7 +646,7 @@ class ImageFetcher:
         )
 
         # ---------- 0) 预筛：1 张中心瓦片 dHash 短路（避免整片区下载） ----------
-        if probe_root:
+        if probe_root and dedup:
             tile_dhash = self._fetch_center_tile_dhash(
                 lat, lon, zoom, date_info, probe_root,
             )
@@ -703,11 +707,13 @@ class ImageFetcher:
         # ---------- 1) 整图 MD5 + 感知 dHash 双重去重 ----------
         img_md5 = self.compute_image_hash(temp_png_path)
         img_dhash = self.compute_dhash_int_from_path(temp_png_path)
-        is_dup, _, _ = self._is_duplicate_image(
-            (img_md5, img_dhash),
-            byte_hashes=self._downloaded_hashes,
-            dhashes=self._downloaded_dhashes,
-        )
+        is_dup = False
+        if dedup:
+            is_dup, _, _ = self._is_duplicate_image(
+                (img_md5, img_dhash),
+                byte_hashes=self._downloaded_hashes,
+                dhashes=self._downloaded_dhashes,
+            )
         if is_dup:
             logger.info(f"[整图去重] {date_str} 与之前版本视觉相同，跳过")
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -850,12 +856,18 @@ class ImageFetcher:
     def fetch_all(self, lat: float, lon: float, zoom: int = 18,
                   output_dir: str = 'data/output/historical',
                   buffer_size: int = 500,
-                  date_range: Optional[Tuple[str, str]] = None) -> List[Dict]:
+                  date_range: Optional[Tuple[str, str]] = None,
+                  dedup: Optional[bool] = None) -> List[Dict]:
         logger.info("=" * 60)
         logger.info(
             f"获取坐标 ({lat:.6f}, {lon:.6f}) 的 {self.info.display_name} 影像"
         )
         logger.info("=" * 60)
+
+        if dedup is None:
+            dedup = self.dedup
+        if not dedup:
+            logger.info("重复检测已关闭：每个历史日期都会单独输出")
 
         # 清空已下载哈希记录（双重：MD5 + dHash）
         self._downloaded_hashes.clear()
@@ -910,6 +922,16 @@ class ImageFetcher:
             # ---------- 已有文件：去重 or 直接跳过（仅限同源） ----------
             if os.path.exists(png_path) and \
                     self._read_metadata_source(date_dir) == self.info.name:
+                if not dedup:
+                    skipped_existing += 1
+                    logger.info(f"已存在文件，跳过下载: {date_str}")
+                    results.append({
+                        'date': date_str,
+                        'name': date_info.get('name', date_str),
+                        'status': 'existing',
+                        'file_path': tif_path if os.path.exists(tif_path) else None,
+                    })
+                    continue
                 is_dup, img_md5, img_dhash = self._is_duplicate_image(
                     png_path,
                     byte_hashes=self._downloaded_hashes,
@@ -943,7 +965,7 @@ class ImageFetcher:
             # ---------- 新下载：启用中心瓦片预筛 ----------
             result = self.download_image(
                 lat, lon, zoom, date_info, output_dir, buffer_size,
-                probe_root=probe_root,
+                probe_root=probe_root, dedup=dedup,
             )
 
             if result is None:
@@ -995,7 +1017,8 @@ class ImageFetcher:
                     zoom: int = 18,
                     buffer_size: int = 500,
                     date_range: Optional[Tuple[str, str]] = None,
-                    coord_concurrency: int = 1) -> List[Dict]:
+                    coord_concurrency: int = 1,
+                    dedup: Optional[bool] = None) -> List[Dict]:
         """批量获取多坐标点的影像。
 
         Args:
@@ -1045,6 +1068,7 @@ class ImageFetcher:
                     output_dir=coord_out,
                     buffer_size=buffer_size,
                     date_range=date_range,
+                    dedup=dedup,
                 )
             except ValueError as e:
                 logger.error(f"[{i}/{total}] {sub} 坐标越界: {e}")
