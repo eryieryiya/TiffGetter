@@ -1,439 +1,250 @@
-# 卫星影像处理工具 - Satellite Image Processing Tool
+# TiffGetter - ESRI Wayback 历史影像获取工具
 
-一个模块化的地理空间数据处理工具，用于从点数据生成缓冲区并下载多源卫星影像，最终生成带有地理参考的 TIFF 影像。
+获取坐标点的所有历史时期卫星影像（ESRI Wayback 数据源），生成带地理参考的 GeoTIFF/PNG 文件。
 
-## 📋 目录
+支持单点下载与批量下载（CSV / SHP）；提供命令行与图形界面两种使用方式。
 
-- [功能特性](#-功能特性)
-- [系统要求](#-系统要求)
-- [安装说明](#-安装说明)
-- [项目结构](#-项目结构)
-- [配置说明](#-配置说明)
-- [使用方法](#-使用方法)
-- [输入输出](#-输入输出)
-- [示例](#-示例)
-- [注意事项](#-注意事项)
-- [故障排除](#-故障排除)
+## 功能
 
-## ✨ 功能特性
+- 输入单个坐标（经纬度），获取该点所有历史时期的卫星影像
+- 批量下载：CSV / SHP 文件批量坐标，Point 直接取点、Polygon 自动取 centroid
+- 数据源自 **ESRI Wayback**，提供全球历史卫星影像
+- 支持日期范围筛选
+- 可调节缩放级别（1-20）和缓冲区大小
+- 多线程并发下载，自动 MD5 去重
+- 输出 GeoTIFF（带地理参考）和 PNG 预览
+- 提供命令行和图形界面两种使用方式
+- GUI 三 Tab：单点下载（含地图选点）/ 批量下载 / 清理与维护
+- 启动时自动清理 `temp_tiles_*` 临时瓦片残余
 
-- **多格式支持**：支持 KML 和 ESRI Shapefile (SHP) 格式的点数据输入
-- **缓冲区生成**：为点数据自动生成指定大小的正方形缓冲区
-- **多数据源支持**：
-  - ESRI World Imagery
-  - Google Earth
-  - Bing Maps
-  - OpenStreetMap
-- **历史影像**：支持通过 ESRI Wayback 服务下载历史卫星影像
-- **智能处理**：
-  - 自动计算最佳缩放级别
-  - 动态线程池优化
-  - 自动重试机制
-- **多种输出格式**：
-  - Shapefile (SHP)
-  - KML
-  - 地理参考 TIFF (GeoTIFF)
-- **用户界面**：提供图形化界面 (GUI) 和命令行两种使用方式
+## 使用方法
 
-## 💻 系统要求
+### 命令行
 
-- **操作系统**：Windows 10/11, macOS, Linux
-- **Python 版本**：3.10 或更高（推荐 3.13）
-- **内存**：至少 4GB RAM
-- **磁盘空间**：至少 50GB 可用空间（用于临时文件和输出）
-- **网络**：稳定的互联网连接（用于下载卫星影像）
-
-## 📦 安装说明
-
-### 方法一：使用 Conda（推荐）
+#### 单点模式（向后兼容）
 
 ```bash
-# 1. 克隆或下载项目
-cd modular_version
+# 基本用法 - 获取东京塔的历史影像
+python main.py --lat 35.6586 --lon 139.7454
 
-# 2. 创建 conda 环境
-conda env create -f environment.yml
+# 指定缩放级别和缓冲区大小
+python main.py --lat 35.6586 --lon 139.7454 --zoom 18 --buffer 500
 
-# 3. 激活环境
-conda activate satellite-image-processing
+# 指定输出目录
+python main.py --lat 35.6586 --lon 139.7454 --output ./output
+
+# 日期范围筛选
+python main.py --lat 35.6586 --lon 139.7454 --date-range 2020-01-01 2024-12-31
 ```
 
-### 方法二：手动安装
+#### 批量模式（CSV / SHP）
 
 ```bash
-# 1. 创建虚拟环境
-python -m venv venv
-venv\Scripts\activate  # Windows
-source venv/bin/activate  # macOS/Linux
+# CSV 文件
+python main.py --coords-file points.csv --output ./batch_out
 
-# 2. 安装 GDAL（使用 conda 或系统包管理器）
-conda install -c conda-forge gdal
+# SHP 文件（自动读 .prj 转 WGS84，Polygon 取 centroid）
+python main.py --coords-file sites.shp --output ./batch_out
 
-# 3. 安装其他依赖
-pip install requests pillow numpy rasterio pyyaml psutil ttkbootstrap
+# 日期范围 + 并发数
+python main.py --coords-file points.csv --date-range 2024-01-01 2024-12-31 \
+    --coord-concurrency 2 --output ./batch_out
 ```
 
-### 验证安装
+#### CSV 文件格式
+
+表头必须含 `lat` 与 `lon`；可选 `name`、`id`。UTF-8 编码，逗号/分号/Tab 自动识别。
+
+```csv
+name,id,lat,lon
+Tokyo Tower,tokyo_tower,35.6586,139.7454
+Beijing,Tiananmen,39.9087,116.3975
+New York,liberty,40.6892,-74.0445
+```
+
+#### SHP 文件要求
+
+- 几何类型：Point / Polygon / MultiPolygon；其他几何被跳过
+- CRS：自动读取 `.prj`；非 EPSG:4326 时使用 `pyproj` 转换
+- 名称字段：优先 `name` / `id` / `name` / `name_zh` / 名称；否则取第一个字符串型字段
+
+### GUI
 
 ```bash
-python -c "from osgeo import ogr, osr; print('GDAL 安装成功')"
-```
-
-## 📁 项目结构
-
-```
-modular_version/
-├── __init__.py              # 包初始化文件
-├── buffer_generator.py      # 缓冲区生成模块
-├── config.py                # 配置管理模块
-├── config.yaml              # 配置文件
-├── point_kml2tif.py         # 主程序入口
-├── point_reader.py          # 点数据读取模块
-├── satellite_processor.py   # 卫星影像处理模块
-├── ui_main.py               # 图形用户界面
-├── environment.yml          # Conda 环境配置
-├── setup.md                 # 详细配置指南
-├── README.md                # 本文件
-└── data/                    # 数据目录
-    ├── input/               # 输入数据目录
-    │   ├── kml/             # KML 输入文件
-    │   └── shp/             # SHP 输入文件
-    └── output/              # 输出数据目录
-        ├── shp/             # Shapefile 输出
-        ├── kml/             # KML 输出
-        ├── tiff_output/     # GeoTIFF 输出
-        └── temp_tiles/      # 临时瓦片目录
-```
-
-### 核心模块说明
-
-| 模块 | 功能 |
-|------|------|
-| `point_reader.py` | 读取 KML 和 SHP 文件中的点坐标数据 |
-| `buffer_generator.py` | 为点数据生成正方形缓冲区 |
-| `satellite_processor.py` | 下载卫星影像并生成地理参考 TIFF |
-| `point_kml2tif.py` | 主程序，协调整个处理流程 |
-| `config.py` + `config.yaml` | 配置管理和参数设置 |
-| `ui_main.py` | 图形用户界面 |
-
-## ⚙️ 配置说明
-
-### config.yaml 配置文件
-
-编辑 `config.yaml` 文件来自定义项目行为：
-
-```yaml
-# 路径配置
-paths:
-  input_file: data/input/kml/测试数据.kml  # 输入文件路径
-  output_prefix: square_buffers           # 输出文件前缀
-  shp_output_subdir: shp                  # Shapefile 输出子目录
-  kml_output_subdir: kml                  # KML 输出子目录
-  tiff_output_dir: data/output/tiff_output # TIFF 输出目录
-  temp_tiles_dir: data/output/temp_tiles  # 临时瓦片目录
-
-# 处理参数
-processing:
-  buffer_sizes: [500]      # 缓冲区大小（米）
-  thread_pool_size: 49     # 线程池大小
-  default_zoom: 18         # 默认缩放级别
-  max_zoom: 19             # 最大缩放级别
-  min_zoom: 1              # 最小缩放级别
-  tile_size: 256           # 瓦片大小（像素）
-  request_timeout: 30      # 请求超时（秒）
-  retry_count: 3           # 重试次数
-  download_mode: current   # 下载模式：current/previous/both
-
-# 数据源配置
-data_source:
-  default_data_source: OpenStreetMap  # 默认数据源
-```
-
-### 支持的卫星数据源
-
-| 数据源 | 最大缩放级别 | 特点 |
-|--------|------------|------|
-| ESRI World Imagery | 18 | 全球覆盖，更新频繁 |
-| Google Earth | 20 | 高分辨率，城市地区细节丰富 |
-| Bing Maps | 19 | 全球覆盖，影像质量高 |
-| OpenStreetMap | 19 | 开源地图，需遵守使用政策 |
-
-## 🚀 使用方法
-
-### 方法一：命令行使用
-
-#### 基本用法
-
-```bash
-# 使用配置文件中的默认设置
-python point_kml2tif.py
-```
-
-#### 指定数据源
-
-```bash
-# 使用 Google Earth 数据源
-python point_kml2tif.py --data-source "Google Earth"
-
-# 使用 OpenStreetMap 数据源
-python point_kml2tif.py --data-source "OpenStreetMap"
-```
-
-#### 下载模式
-
-```bash
-# 仅下载当前最新影像（默认）
-python point_kml2tif.py --mode current
-
-# 仅下载前一个时刻的影像
-python point_kml2tif.py --mode previous
-
-# 同时下载当前和历史影像
-python point_kml2tif.py --mode both
-```
-
-#### 组合使用示例
-
-```bash
-# 使用 Google Earth 下载当前影像
-python point_kml2tif.py --data-source "Google Earth" --mode current
-
-# 使用 OpenStreetMap 下载历史和当前影像
-python point_kml2tif.py --data-source "OpenStreetMap" --mode both
-```
-
-### 方法二：图形界面
-
-```bash
-# 启动 GUI 界面
 python ui_main.py
 ```
 
-在界面中：
-1. 选择输入文件（KML 或 SHP）
-2. 设置缓冲区大小
-3. 选择卫星数据源
-4. 选择下载模式
-5. 点击"开始处理"
+图形界面提供完整的参数控制，三 Tab 设计：
 
-### 方法三：Python 模块导入
+| Tab | 功能 |
+|-----|------|
+| 单点下载 | 坐标/参数/日期/输出 + 地图选点（点击地图选坐标） |
+| 批量下载 | CSV/SHP 文件选择 + 预览 + 通用参数 + 结果表 |
+| 清理与维护 | 扫描残留（temp_tiles_*/历史日期目录）+ 勾选 + 二次确认删除 |
 
-```python
-from point_reader import read_points
-from buffer_generator import generate_buffers
-from satellite_processor import SatelliteToTiffConverter
+| 区域 | 参数 | 说明 |
+|------|------|------|
+| 坐标 | 纬度、经度 | 目标点坐标（单点 Tab） |
+| 参数设置 | 缩放级别 (1-20) | 地图瓦片缩放级别 |
+| | 缓冲区（米，50-5000） | 下载范围半径 |
+| 日期范围 | 起始 / 截止（可选） | 筛选特定时间段的影像 |
+| 输出设置 | 输出目录 | 下载文件保存路径 |
+| 批量文件 | CSV / SHP 文件 | 批量下载 Tab |
+| | 坐标并发数 (1-16) | 坐标级并发，默认 1（避免限流） |
 
-# 1. 读取点数据
-points = read_points('data/input/kml/测试数据.kml')
+界面特点：
 
-# 2. 生成缓冲区（500 米）
-shapefile_path, kml_path = generate_buffers(points, 500, 'square_buffers')
+- **ttkbootstrap darkly 主题** — 深色风格、现代化外观
+- **三 Tab 布局** — 单点 / 批量 / 清理 Tab 互不干扰
+- **地图选点** — 嵌入式 OpenStreetMap 地图（Toplevel 弹窗），左键选点回写
+- **进度条** — 日志中的 `[i/N]` 自动驱动 determinate 进度条
+- **结果表** — Treeview 显示 success/existing/duplicate/failed；双击打开所在目录
+- **深色日志面板** — 实时显示下载进度和调试信息
+- **状态栏** — 显示当前任务状态（就绪 / 运行中 / 正在停止 / 完成 / 已停止 / 清理中）
+- **停止按钮** — 支持随时终止正在进行的下载（CTRL_BREAK_EVENT）
+- **清理 Tab** — 勾选式二次确认删除，避免误删
 
-# 3. 下载卫星影像并生成 TIFF
-converter = SatelliteToTiffConverter()
-converter.process_kml_to_tiff(
-    kml_path, 
-    'data/output/tiff_output',
-    download_mode='current',
-    service_name='Google Earth'
-)
-```
+## 参数说明
 
-## 📤 输入输出
+### 通用参数
 
-### 支持的输入格式
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--zoom` | 缩放级别 (1-20) | 18 |
+| `--buffer` | 缓冲区大小（米） | 500 |
+| `--output` | 输出目录 | data/output/historical |
+| `--date-range` | 日期范围筛选（起始 截止） | 全部 |
+| `--coord-concurrency` | 批量模式下坐标并发数 (1-16) | 1 |
 
-1. **KML 文件** (.kml)
-   - Google Earth 点数据格式
-   - 支持 Placemark 中的 Point 元素
-   - 坐标格式：经度，纬度，高度
+### 单点模式（与 `--coords-file` 互斥）
 
-2. **ESRI Shapefile** (.shp)
-   - ESRI 矢量数据格式
-   - 支持点图层
-   - 自动坐标转换到 WGS84
+| 参数 | 说明 | 必填 |
+|------|------|------|
+| `--lat` | 纬度 | 是（与 `--lon` 同时） |
+| `--lon` | 经度 | 是（与 `--lat` 同时） |
 
-### 输出格式
+### 批量模式
 
-1. **Shapefile** (.shp, .shx, .dbf 等)
-   - 位置：`data/output/shp/`
-   - 坐标系：WGS84 (EPSG:4326)
-   - 包含缓冲区多边形
+| 参数 | 说明 | 必填 |
+|------|------|------|
+| `--coords-file` | CSV 或 SHP 文件路径 | 是 |
 
-2. **KML** (.kml)
-   - 位置：`data/output/kml/`
-   - 坐标系：WGS84
-   - 可在 Google Earth 中查看
+## 输出结构
 
-3. **GeoTIFF** (.tif)
-   - 位置：`data/output/tiff_output/`
-   - 包含地理参考信息
-   - 可直接在 GIS 软件中使用
-
-### 输出目录结构
+### 单点模式
 
 ```
-data/output/
-├── shp/
-│   └── square_buffers_500m.shp (及相关文件)
-├── kml/
-│   └── square_buffers_500m.kml
-└── tiff_output/
-    └── 测试数据/
-        ├── png/           # 当前影像 PNG
-        │   └── 20240316_缓冲区 ID.png
-        ├── tif/           # 当前影像 TIFF
-        │   └── 20240316_缓冲区 ID.tif
-        ├── png_previous/  # 历史影像 PNG（mode=previous/both 时）
-        └── tif_previous/  # 历史影像 TIFF（mode=previous/both 时）
+data/output/historical/
+├── 2024-01-15/
+│   ├── 2024-01-15.png
+│   └── 2024-01-15.tif
+├── 2023-06-20/
+│   ├── 2023-06-20.png
+│   └── 2023-06-20.tif
+└── ...
 ```
 
-## 📖 示例
+### 批量模式
 
-### 示例 1：处理日本东京的点数据
+```
+data/output/batch/
+├── tokyo_tower/                  # id 优先；否则 name；否则 point_N_lat_lon
+│   ├── 2024-01-15/
+│   │   ├── 2024-01-15.png
+│   │   └── 2024-01-15.tif
+│   └── 2023-06-20/
+│       ├── 2023-06-20.png
+│       └── 2023-06-20.tif
+├── Tiananmen/
+│   ├── ...
+└── ...
+```
+
+每个历史日期包含：
+- `*.png` — 卫星影像预览图
+- `*.tif` — 带地理参考的 GeoTIFF（CRS: EPSG:4326 WGS84）
+
+## 系统要求
+
+- Python 3.10+
+- [GDAL](https://gdal.org/)（用于 GeoTIFF 输出）
+- 依赖：`requests`, `pillow`, `numpy`, `rasterio`, `psutil`, `pyshp`, `pyproj`, `ttkbootstrap`, `tkintermapview`
+
+## 安装
 
 ```bash
-# 使用配置文件中的默认设置（OpenStreetMap 数据源）
-python point_kml2tif.py
-
-# 输出：
-# - data/output/shp/square_buffers_500m.shp
-# - data/output/kml/square_buffers_500m.kml
-# - data/output/tiff_output/测试数据/tif/时间戳_缓冲区 ID.tif
+conda env create -f environment.yml
+conda activate satellite-image-processing
 ```
 
-### 示例 2：使用 Google Earth 高清影像
+或纯 pip：
 
 ```bash
-# 使用 Google Earth 数据源
-python point_kml2tif.py --data-source "Google Earth"
+pip install requests pillow numpy rasterio psutil pyshp pyproj ttkbootstrap tkintermapview
 ```
 
-### 示例 3：对比历史影像变化
+## 打包为独立 exe
 
-```bash
-# 下载当前和历史影像进行对比
-python point_kml2tif.py --mode both --data-source "ESRI World Imagery"
+将项目打包为独立的 Windows 可执行文件，无需安装 Python 环境即可运行。
+
+### 一键打包
+
+```powershell
+.\build_exe.ps1
 ```
 
-### 示例 4：自定义缓冲区大小
+脚本会自动：
+- 探测可用的 Python 环境（优先使用 Anaconda base）
+- 安装缺失的依赖（pyinstaller、tkcalendar）
+- 执行 PyInstaller 打包
+- 验证产物（CLI --help、GUI 启动冒烟、归档内容检查）
 
-编辑 `config.yaml`：
+### 产物
 
-```yaml
-processing:
-  buffer_sizes: [100, 500, 1000]  # 生成三种大小的缓冲区
+```
+dist/TiffGetter.exe    # 约 83 MB，onefile 单文件
 ```
 
-然后运行：
+### 使用方式
 
-```bash
-python point_kml2tif.py
+- **GUI 模式**：双击 `TiffGetter.exe`
+- **CLI 模式**：`TiffGetter.exe --lat 35.6586 --lon 139.7454`
+
+### 构建环境要求
+
+- Python 3.10+（推荐 3.12）
+- PyInstaller 6.x
+- 所有项目依赖（见 `environment.yml`）
+
+### 已知问题与解决方案
+
+打包过程中可能遇到的问题及解决方案已内置到 `TiffGetter.spec` 中：
+
+1. **Tcl/Tk DLL 版本冲突**：多 conda 环境 PATH 污染时，PyInstaller 可能从错误的环境收集 tcl86t.dll。spec 中的 `_normalize_tcl_binaries()` 函数会自动修正。
+
+2. **ttkbootstrap 资源缺失**：ttkbootstrap 无官方 PyInstaller hook，spec 中通过 `collect_data_files('ttkbootstrap')` 手动收集主题资源。
+
+3. **rasterio 子模块缺失**：PyInstaller 静态分析无法发现 rasterio 的动态导入子模块，spec 中通过 `hiddenimports` 显式声明所有子模块。
+
+4. **tkcalendar 与主题切换兼容性**：DateEntry 组件不使用 `bootstyle` 参数，避免 Calendar 内部对象缺少 `.style` 属性导致的 AttributeError。
+
+### 手动打包
+
+如需自定义打包参数：
+
+```powershell
+# 使用指定的 Python 环境
+.\build_exe.ps1 -Python D:\Python312\python.exe
+
+# 跳过自动安装依赖
+.\build_exe.ps1 -NoInstallDeps
+
+# 跳过打包后验证
+.\build_exe.ps1 -SkipVerify
 ```
 
-## ⚠️ 注意事项
+## 旧版本残余清理
 
-### 1. OpenStreetMap 使用政策
+启动时 `WaybackImageFetcher.__init__` 会自动清理根目录下所有 `temp_tiles_*` 目录。
 
-使用 OpenStreetMap 数据源时，请遵守其使用政策：
-- 必须设置合适的 User-Agent
-- 限制请求频率，避免对服务器造成过大压力
-- 大量下载建议使用本地镜像或其他商业数据源
-
-### 2. 坐标系统
-
-- 所有处理均使用 WGS84 坐标系 (EPSG:4326)
-- KML 文件坐标格式：经度，纬度，高度
-- Shapefile 文件自动处理坐标转换
-- GDAL 3.0+ 版本已设置传统 GIS 坐标轴顺序（经度在前）
-
-### 3. 缩放级别选择
-
-- 程序会自动根据缓冲区大小计算最佳缩放级别
-- 默认缩放级别：18
-- 最大缩放级别取决于数据源（18-20）
-- 缩放级别越高，影像分辨率越高，下载时间越长
-
-### 4. 网络要求
-
-- 需要稳定的互联网连接
-- 大量瓦片下载可能需要较长时间
-- 建议在网络状况良好时使用
-
-## 🔧 故障排除
-
-### 常见问题
-
-#### 1. GDAL 安装失败
-
-**问题**：`pip install gdal` 失败
-
-**解决方案**：
-```bash
-# 使用 conda 安装（推荐）
-conda install -c conda-forge gdal
-
-# 或使用预编译的 wheel 文件
-pip install GDAL --only-binary GDAL
-```
-
-#### 2. 卫星影像下载失败
-
-**问题**：瓦片下载失败或响应超时
-
-**解决方案**：
-- 检查网络连接
-- 减少线程池大小（在 config.yaml 中设置 `thread_pool_size: 10`）
-- 增加请求超时时间（`request_timeout: 60`）
-- 尝试更换数据源
-
-#### 3. 坐标顺序错误
-
-**问题**：生成的文件中经纬度颠倒
-
-**解决方案**：
-- 确保使用最新版本的代码（已设置坐标轴顺序）
-- KML 文件坐标格式应为：经度，纬度，高度
-- 检查 GDAL 版本，确保为 3.0+
-
-#### 4. 内存不足
-
-**问题**：处理大区域时内存不足
-
-**解决方案**：
-- 减少线程池大小
-- 降低缩放级别
-- 减小缓冲区大小
-- 分批处理多个点
-
-#### 5. 输出文件为空
-
-**问题**：生成的 TIFF 文件为空白
-
-**解决方案**：
-- 检查输入文件是否包含有效的点坐标
-- 确认坐标范围在有效区域内
-- 查看日志中的瓦片下载成功率
-- 尝试降低缩放级别
-
-### 日志查看
-
-程序运行时会输出详细的日志信息：
-- 点数据读取情况
-- 缓冲区生成参数
-- 瓦片下载进度
-- 错误和警告信息
-
-如遇到问题，请仔细查看日志输出以定位问题。
-
-## 📝 许可证
-
-本项目采用 MIT 许可证。
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 📧 联系方式
-
-如有问题或建议，请提交 Issue。
+也可在 GUI「清理与维护」Tab 手动扫描 temp_tiles + 历史日期子目录，勾选后二次确认批量删除。

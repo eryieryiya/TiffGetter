@@ -1,16 +1,27 @@
 name: satellite-image-processing
 channels:
-  - conda-forge
-  - defaults
+  - conda-forge   # 推荐使用 conda-forge 保证兼容性；若下载慢可改国内镜像（如 https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge）
+  - defaults      # conda 默认 channel，作为兜底
 dependencies:
-  - python=3.13
-  - gdal
-  - pip
+  - python=3.13   # 固定 Python 版本；3.13 已验证可与下方所有依赖兼容
+  # ---- 地理/栅格处理核心（通过 conda 安装以避免 C 扩展编译问题） ----
+  - gdal          # GIS 基底层（地理转换、栅格读写），rasterio/pyproj 等均间接依赖
+  - pip           # 用 pip 安装 PyPI 上的 ttkbootstrap 等 GUI/工具包
   - pip:
-    - requests
-    - pillow
-    - numpy
-    - rasterio
-    - pyyaml
-    - psutil
-    - ttkbootstrap
+    # ---- 通用基础 ----
+    - requests    # 网络请求（下载瓦片、查询 Wayback 版本元数据）
+    - pillow      # PIL（瓦片拼合、图像预处理）
+    - numpy       # 数值计算（矩阵、图像数组）
+    - rasterio    # TIFF 写入与栅格处理（延迟导入，缺省时自动降级为仅保存 PNG）
+    - psutil      # 进程监控（CPU/内存使用、后台进程管理）
+
+    # ---- UI 现代化（依赖缺失时程序仍可运行，仅降级为原生 ttk） ----
+    - ttkbootstrap   # 主题/色彩系统、圆角按钮、进度条等现代 ttk 控件
+    # tkcalendar      # 可选：日期选择器（若 Wayback 需按日期精确筛选可启用）
+
+    # ---- 批量坐标下载（CSV / SHP） ----
+    - pyshp      # 读取 SHP (ESRI Shapefile) 坐标点
+    - pyproj     # 坐标转换（SHP 中的非 WGS84 投影 → 经纬度）
+
+    # ---- 可选：GUI 地图选点（离线网络环境可跳过） ----
+    - tkintermapview   # 提供交互式 Tk 地图控件（基于在线瓦片，需联网）

@@ -1,1472 +1,1188 @@
-# 卫星影像处理模块 - 处理卫星影像下载和地理参考TIFF生成
-
+# ESRI Wayback 历史影像获取模块
 import os
-import re
 import time
 import requests
 import concurrent.futures
-import threading
-import random
 import math
 import shutil
 import logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
+import hashlib
+import re
+import urllib3
 from PIL import Image
 from typing import List, Dict, Tuple, Optional
 import numpy as np
-import rasterio
-from rasterio.transform import from_bounds
-from xml.etree import ElementTree as ET
+import warnings
+warnings.filterwarnings('ignore')
 
-# 配置日志
-log_dir = os.path.join(os.path.dirname(__file__), 'logs')
-os.makedirs(log_dir, exist_ok=True)
+# rasterio 是 GeoTIFF 输出所必需，但部分 Conda 环境可能缺失 expat；
+# 采用延迟导入：仅在调用 png_to_geotiff 时尝试 import，
+# 让瓦片下载/拼接/批量入口等核心功能在 rasterio 不可用时仍可使用。
+_RASTERIO_AVAILABLE = False
+try:
+    import rasterio  # noqa: F401
+    from rasterio.transform import from_bounds
+    _RASTERIO_AVAILABLE = True
+except Exception as _ra:
+    # 记录真实失败原因（打包态常见：DLL 缺失 / 数据文件路径问题），
+    # 避免只留下"请安装 rasterio"的猜测性提示
+    import traceback as _tb
+    _tb.print_exc()
+    print(f"[rasterio 导入失败] {type(_ra).__name__}: {_ra}")
+    rasterio = None
+    from_bounds = None
 
-# 创建日志记录器
+# 关闭 ESRI wayback 域名的 SSL 警告（其证书链有时触发告警）
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 logger = logging.getLogger('TiffGetter')
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
+# 仅当根 logger 尚未配置时才自建 handler（独立运行 / 单测场景）。
+# main.py 入口会先 basicConfig 配置 root(stdout)，此时本 logger 直接
+# 传播到 root 即可；否则同一条日志会同时打到 stderr 与 stdout，
+# 导致终端与 GUI 日志面板（stderr 并入 stdout）重复显示。
+if not logger.handlers and not logging.getLogger().handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+    logger.propagate = False
 
-# 创建文件处理器，设置日志文件大小限制和轮转
-log_file = os.path.join(log_dir, 'tiff_getter.log')
-file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
-file_handler.setLevel(logging.DEBUG)
+from config import WGS84_WKT, THREAD_POOL_SIZE
 
-# 创建控制台处理器，只显示INFO及以上级别的日志
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-# 设置日志格式
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-console_handler.setFormatter(formatter)
-
-# 添加处理器到记录器
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
-
-from config import (
-    THREAD_POOL_SIZE, REQUEST_TIMEOUT, RETRY_COUNT, 
-    USER_AGENTS, SATELLITE_SERVICES, WGS84_WKT,
-    PATHS, GOOGLE_EARTH_API, WAYBACK_SERVICES
-)
-from google_earth_client import GoogleEarthClient
+# 自定义异常：瓦片未下载完整
+class IncompleteTilesError(Exception):
+    pass
 
 
-class SatelliteToTiffConverter:
-    def __init__(self, debug=False):
-        """初始化卫星图像转换器
-        
-        Args:
-            debug: 是否开启调试模式
-        """
-        # 卫星影像服务配置
-        self.services = SATELLITE_SERVICES
-        
-        # ESRI Wayback 历史影像服务
-        self.wayback_services = WAYBACK_SERVICES
-        
-        # Google Earth API客户端
-        ge_timeout = GOOGLE_EARTH_API.get('timeout', REQUEST_TIMEOUT)
-        self.ge_client = GoogleEarthClient(timeout=ge_timeout)
-        
-        # 会话池配置
-        self.session = requests.Session()
-        
-        # 动态线程池大小 - 减少并发连接数以避免网络错误
-        self.thread_pool_size = min(self.get_optimal_thread_pool_size(), 20)
-        self.debug = debug
-        
-        # 根据debug参数设置控制台日志级别
-        if self.debug:
-            console_handler.setLevel(logging.DEBUG)
-            logger.debug(f"[调试模式] 使用动态线程池大小: {self.thread_pool_size}")
-        else:
-            console_handler.setLevel(logging.INFO)
-            logger.info(f"使用动态线程池大小: {self.thread_pool_size}")
-        
-        # 配置更保守的HTTP适配器
+# ESRI Wayback 版本列表（fallback 用，仅当在线 endpoint 完全不可用时的最后兜底）
+# 仅保留最近确认的 5 条 ID；在线路径优先。
+KNOWN_WAYBACK_VERSIONS = [
+    {"id": "20512", "date": "2026-05-28"},
+    {"id": "32553", "date": "2024-08-15"},
+    {"id": "64776", "date": "2023-08-31"},
+    {"id": "296", "date": "2023-02-23"},
+    {"id": "273", "date": "2023-01-27"},
+]
+
+
+class WaybackImageFetcher:
+    # ESRI 在线 wayback 服务元数据 endpoint（实测确认）
+    # 响应 JSON 含 "Selection" 列表：{"Name": "World Imagery (Wayback YYYY-MM-DD)",
+    #                                  "M": "26334", "ID": "WB_2026_R07"}
+    WAYBACK_METADATA_URL = (
+        "https://wayback.maptiles.arcgis.com/arcgis/rest/services/"
+        "world_imagery/MapServer?f=json"
+    )
+    # 瓦片 URL 主模板（实测可用，wayback_id 即 Selection[].M）
+    WAYBACK_TILE_URL_TEMPLATE = (
+        "https://wayback.maptiles.arcgis.com/arcgis/rest/services/"
+        "world_imagery/MapServer/tile/{wayback_id}/{z}/{y}/{x}"
+    )
+    # 备用 WMTS 模板（wayback-a 子域名，实测同样返回内容）
+    WAYBACK_TILE_URL_FALLBACK = (
+        "https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/"
+        "world_imagery/wmts/1.0.0/default028mm/mapserver/tile/"
+        "{wayback_id}/{z}/{y}/{x}"
+    )
+
+    def __init__(self):
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=min(self.thread_pool_size, 10),
-            pool_maxsize=min(self.thread_pool_size * 2, 20),
-            max_retries=3,
-            pool_block=False
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=requests.packages.urllib3.util.retry.Retry(
+                total=3, backoff_factor=0.5
+            )
         )
+        self.session = requests.Session()
         self.session.mount('https://', adapter)
-        self.session.mount('http://', adapter)
-        
-        self.lock = threading.Lock()
-        self.downloaded_count = 0
-        
-        # 缓存历史日期列表
-        self._service_dates_cache = {}
-        
-        # OpenStreetMap子域名
-        self.osm_subdomains = ['a', 'b', 'c']
-        
-        # 任务优先级队列
-        self.priority_queue = []
-        
-        # 错误统计
-        self.error_stats = {
-            'network_errors': 0,
-            'tile_errors': 0,
-            'api_errors': 0,
-            'other_errors': 0
-        }
-    
-    def get_random_user_agent(self) -> str:
-        """获取随机User-Agent"""
-        return random.choice(USER_AGENTS)
-    
-    def tile_to_quadkey(self, x: int, y: int, zoom: int) -> str:
-        """将瓦片坐标转换为Bing Maps quadkey"""
-        quadkey = []
-        for i in range(zoom, 0, -1):
-            digit = 0
-            mask = 1 << (i - 1)
-            if (x & mask) != 0:
-                digit += 1
-            if (y & mask) != 0:
-                digit += 2
-            quadkey.append(str(digit))
-        return ''.join(quadkey)
-    
-    def get_service_by_name(self, name: str) -> Optional[Dict]:
-        """根据服务名称获取服务配置"""
-        for service in self.services:
-            if service.get('name') == name:
-                return service
-        return None
-    
-    def get_optimal_thread_pool_size(self) -> int:
-        """根据系统资源动态计算最优线程池大小"""
-        import os
-        import psutil
-        
-        try:
-            cpu_count = os.cpu_count() or 4
-            available_memory = psutil.virtual_memory().available / (1024 * 1024)
-            base_threads = int(cpu_count * 1.5)
-            memory_based_threads = int(available_memory / 100)
-            optimal_threads = min(base_threads, memory_based_threads)
-            optimal_threads = max(4, min(optimal_threads, 100))
-            config_threads = PROCESSING.get('thread_pool_size')
-            if config_threads:
-                optimal_threads = min(config_threads, optimal_threads)
-            return optimal_threads
-        except ImportError:
-            return min(THREAD_POOL_SIZE, 50)
-        except Exception:
-            return min(THREAD_POOL_SIZE, 50)
-    
-    def _build_current_date_dict(self, service_config: Optional[Dict] = None) -> Dict:
-        """构建当前影像日期字典
-        
-        Args:
-            service_config: 服务配置，如果为None则使用默认配置
-        
-        Returns:
-            当前影像日期字典
-        """
-        if service_config:
-            name = service_config.get('name', 'Google Earth (Current)')
-            description = service_config.get('description', '最新的全球卫星影像')
-            url_template = service_config.get('url_template', 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}')
-        else:
-            name = 'Google Earth (Current)'
-            description = '最新的全球卫星影像'
-            url_template = 'https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}'
-        
-        return {
-            'id': 1,
-            'timestamp': 1735689600000,  # 固定时间戳 2025-01-01
-            'date': '2025-01-01',  # 固定日期，不使用当前系统时间
-            'name': name,
-            'description': description,
-            'url_template': url_template,
-            'source': 'current_service'
-        }
-    
-    def get_historical_dates_for_service(self, service_name: str,
-                                           center_lat: float = None, center_lon: float = None, zoom: int = None) -> List[Dict]:
-        """根据数据源类型获取可用的历史影像日期列表
-        
-        Args:
-            service_name: 数据源名称
-            center_lat: 中心纬度
-            center_lon: 中心经度
-            zoom: 缩放级别
-        
-        Returns:
-            可用日期字典列表
-        """
-        cache_key = f"{service_name}_{center_lat}_{center_lon}_{zoom}"
-        if cache_key in self._service_dates_cache:
-            return self._service_dates_cache[cache_key]
-        
-        service = self.get_service_by_name(service_name)
-        historical_support = service.get('historical_support', 'none') if service else 'none'
-        
-        dates = []
-        dates.append(self._build_current_date_dict(service))
-        
-        wayback_success = False
-        google_earth_success = False
-        
-        # 尝试使用 ESRI Wayback 服务
-        if historical_support in ['wayback', 'both']:
-            logger.info("正在使用 ESRI Wayback 历史影像服务...")
-            
-            if center_lat is not None and center_lon is not None and zoom is not None:
-                try:
-                    logger.info("查询区域可用的历史版本...")
-                    wayback_api_url = "https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer"
-                    
-                    n = 1 << zoom
-                    tile_x = int((center_lon + 180.0) / 360.0 * n)
-                    tile_y = int((1.0 - math.log(math.tan(math.radians(center_lat)) + 1.0 / math.cos(math.radians(center_lat))) / math.pi) / 2.0 * n)
-                    tile_x = max(0, min(tile_x, n - 1))
-                    tile_y = max(0, min(tile_y, n - 1))
-                    
-                    query_url = f"https://wayback.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/getWaybackItemsWithLocalChanges"
-                    params = {
-                        'f': 'json',
-                        'x': tile_x,
-                        'y': tile_y,
-                        'level': zoom
-                    }
-                    
-                    headers = {
-                        'User-Agent': self.get_random_user_agent(),
-                        'Accept': 'application/json',
-                        'Referer': 'https://www.arcgis.com/'
-                    }
-                    
-                    response = requests.get(query_url, params=params, headers=headers, timeout=30)
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    available_items = data.get('waybackItems', [])
-                    logger.info(f"找到 {len(available_items)} 个可用的历史版本")
-                    
-                    for item in available_items:
-                        release_num = item.get('releaseNum')
-                        release_date = item.get('releaseDateLabel', '')
-                        item_url = item.get('itemURL', '')
-                        
-                        if item_url:
-                            item_url = item_url.replace('{level}', '{z}').replace('{row}', '{y}').replace('{col}', '{x}')
-                        
-                        if release_num and release_date:
-                            dates.append({
-                                'id': release_num,
-                                'timestamp': int(datetime.strptime(release_date, '%Y-%m-%d').timestamp() * 1000) if release_date else 0,
-                                'date': release_date,
-                                'name': f"Wayback {release_date}",
-                                'description': item.get('itemTitle', f"ESRI Wayback {release_date}"),
-                                'url_template': item_url if item_url else f"https://wayback-a.maptiles.arcgis.com/arcgis/rest/services/world_imagery/wmts/1.0.0/default028mm/mapserver/tile/{release_num}/{{z}}/{{y}}/{{x}}",
-                                'source': 'wayback'
-                            })
-                    
-                    wayback_success = len(available_items) > 0
-                    
-                except Exception as e:
-                    logger.error(f"查询 ESRI Wayback 可用版本时出错: {e}")
-                    logger.info("使用配置文件中的版本列表作为备用...")
-                    for wb_service in self.wayback_services:
-                        date_str = wb_service['date']
-                        dates.append({
-                            'id': wb_service.get('id', len(dates) + 100),
-                            'timestamp': int(datetime.strptime(date_str, '%Y-%m-%d').timestamp() * 1000),
-                            'date': date_str,
-                            'name': wb_service.get('name', date_str),
-                            'description': wb_service.get('name', date_str),
-                            'url_template': wb_service['url_template'],
-                            'source': 'wayback'
-                        })
-                    wayback_success = len(self.wayback_services) > 0
-            else:
-                logger.info("未提供坐标信息，使用配置文件中的版本列表...")
-                for wb_service in self.wayback_services:
-                    date_str = wb_service['date']
-                    dates.append({
-                        'id': wb_service.get('id', len(dates) + 100),
-                        'timestamp': int(datetime.strptime(date_str, '%Y-%m-%d').timestamp() * 1000),
-                        'date': date_str,
-                        'name': wb_service.get('name', date_str),
-                        'description': wb_service.get('name', date_str),
-                        'url_template': wb_service['url_template'],
-                        'source': 'wayback'
-                    })
-                wayback_success = len(self.wayback_services) > 0
-            
-        # 尝试使用 Google Earth API 服务
-        if (historical_support in ['google_earth_api', 'both']) or (not wayback_success and historical_support != 'none'):
-            logger.info("正在使用 Google Earth API 历史影像服务...")
-            if center_lat is not None and center_lon is not None and zoom is not None:
-                try:
-                    if not self.ge_client.initialize():
-                        logger.warning("Google Earth客户端初始化失败，将只使用当前影像")
-                    else:
-                        n = 1 << zoom
-                        tile_x = int((center_lon + 180.0) / 360.0 * n)
-                        tile_y = int((1.0 - math.log(math.tan(math.radians(center_lat)) + 1.0 / math.cos(math.radians(center_lat))) / math.pi) / 2.0 * n)
-                        tile_x = max(0, min(tile_x, n - 1))
-                        tile_y = max(0, min(tile_y, n - 1))
-                        
-                        ge_dates = self.ge_client.get_dates_for_area(tile_x, tile_y, zoom)
-                        
-                        for ge_date in ge_dates:
-                            date_str = ge_date['date']
-                            dates.append({
-                                'id': ge_date.get('packed_date', len(dates) + 100),
-                                'timestamp': int(datetime.strptime(date_str, '%Y-%m-%d').timestamp() * 1000),
-                                'date': date_str,
-                                'name': f"{ge_date['year']}年{ge_date['month']}月影像 (Google Earth)",
-                                'description': f"{date_str} 的历史影像 (Google Earth Flatfile API)",
-                                'hex_date': ge_date['hex_date'],
-                                'epoch': ge_date['epoch'],
-                                'source': 'google_earth_api'
-                            })
-                        
-                        google_earth_success = len(ge_dates) > 0
-                except Exception as e:
-                    logger.error(f"查询Google Earth历史影像日期时出错: {e}")
-            else:
-                logger.info("未提供坐标信息，无法查询Google Earth历史影像日期")
-        
-        elif historical_support == 'none':
-            logger.info(f"数据源 '{service_name}' 不支持历史影像")
-        
-        # 按时间戳排序，确保最新的影像在前面
-        dates.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
-        
-        self._service_dates_cache[cache_key] = dates
-        logger.info(f"成功获取 {len(dates)} 个影像服务版本")
-        for date_info in dates:
-            logger.debug(f"  - {date_info['name']}: {date_info['date']} - {date_info.get('description', '')}")
-        
-        return dates
-    
-    def get_current_and_previous_dates(self, service_name: str = None,
-                                       center_lat: float = None, center_lon: float = None, zoom: int = None) -> Tuple[Optional[Dict], Optional[Dict]]:
-        """获取当前影像和前一个时刻的影像日期信息
-        
-        Args:
-            service_name: 数据源名称
-            center_lat: 中心纬度
-            center_lon: 中心经度
-            zoom: 缩放级别
-        
-        Returns:
-            (current_date, previous_date) 元组
-        """
-        if service_name is None:
-            service_name = 'Google Earth'
-        
-        dates = self.get_historical_dates_for_service(service_name, center_lat, center_lon, zoom)
-        if not dates:
-            return None, None
-        
-        current_date = dates[0] if dates else None
-        
-        previous_date = None
-        if len(dates) >= 2:
-            for i in range(1, len(dates)):
-                if dates[i].get('source') != 'current_service':
-                    previous_date = dates[i]
-                    logger.info(f"选择历史影像版本: {dates[i].get('date', 'unknown')} (ID: {dates[i].get('id', 'unknown')}, 来源: {dates[i].get('source', 'unknown')})")
-                    break
-        
-        return current_date, previous_date
-    
-    def print_error_stats(self):
-        """打印错误统计信息"""
-        logger.info("\n=== 错误统计 ===")
-        logger.info(f"网络错误: {self.error_stats['network_errors']}")
-        logger.info(f"瓦片错误: {self.error_stats['tile_errors']}")
-        logger.info(f"API错误: {self.error_stats['api_errors']}")
-        logger.info(f"其他错误: {self.error_stats['other_errors']}")
-        total_errors = sum(self.error_stats.values())
-        logger.info(f"总计错误: {total_errors}")
-        print("================")
-    
-    def download_tile_worker_with_url(self, url: str, save_path: str, headers: Dict) -> bool:
-        """使用指定URL下载单个瓦片
-        
-        支持断点续传和瓦片缓存
-        """
-        if os.path.exists(save_path):
-            file_size = os.path.getsize(save_path)
-            if file_size > 100:
-                if self.debug:
-                    logger.debug(f"[调试] 瓦片已存在且有效，跳过下载: {save_path}")
-                return True
-            else:
-                if self.debug:
-                    logger.debug(f"[调试] 瓦片文件大小异常，删除后重新下载: {save_path}")
-                try:
-                    os.remove(save_path)
-                except:
-                    pass
-        
-        time.sleep(0.1)
-        
-        for attempt in range(RETRY_COUNT + 1):
-            try:
-                if attempt > 0:
-                    if self.debug:
-                        logger.debug(f"[调试] 重试下载瓦片 ({attempt+1}/{RETRY_COUNT+1}): {url}")
-                    else:
-                        logger.info(f"  重试下载瓦片 ({attempt+1}/{RETRY_COUNT+1}): {url}")
-                elif self.debug:
-                    logger.debug(f"[调试] 开始下载瓦片: {url}")
-                
-                headers_copy = headers.copy()
-                if os.path.exists(save_path):
-                    file_size = os.path.getsize(save_path)
-                    headers_copy['Range'] = f"bytes={file_size}-"
-                    if self.debug:
-                        logger.debug(f"[调试] 尝试断点续传，已下载 {file_size} 字节")
-                
-                response = self.session.get(
-                    url,
-                    headers=headers_copy,
-                    timeout=60,
-                    stream=True,
-                    verify=True,
-                    allow_redirects=True
-                )
-                
-                if response.status_code == 206:
-                    if self.debug:
-                        logger.debug(f"[调试] 断点续传成功，响应状态码: {response.status_code}")
-                    mode = 'ab'
-                else:
-                    response.raise_for_status()
-                    mode = 'wb'
-                
-                content_type = response.headers.get('Content-Type', '')
-                if not content_type.startswith('image/'):
-                    error_msg = f"瓦片下载失败: 响应不是图像类型 ({content_type})"
-                    if self.debug:
-                        logger.debug(f"[调试] {error_msg}")
-                        logger.debug(f"[调试] 响应内容: {response.text[:200]}...")
-                    else:
-                        logger.warning(f"  {error_msg}")
-                    if attempt < RETRY_COUNT:
-                        time.sleep(1.0 * (2 ** attempt))
-                        continue
-                    self.error_stats['tile_errors'] += 1
-                    return False
-                
-                os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                
-                with open(save_path, mode) as f:
-                    for chunk in response.iter_content(chunk_size=4096):
-                        if chunk:
-                            f.write(chunk)
-                            time.sleep(0.001)
-                
-                file_size = os.path.getsize(save_path)
-                if file_size < 100:
-                    error_msg = f"瓦片下载失败: 文件大小异常 ({file_size} 字节)"
-                    if self.debug:
-                        logger.debug(f"[调试] {error_msg}")
-                    else:
-                        logger.warning(f"  {error_msg}")
-                    os.remove(save_path)
-                    if attempt < RETRY_COUNT:
-                        time.sleep(1.0 * (2 ** attempt))
-                        continue
-                    self.error_stats['tile_errors'] += 1
-                    return False
-                
-                with self.lock:
-                    self.downloaded_count += 1
-                
-                if self.debug:
-                    logger.debug(f"[调试] 瓦片下载成功: {url} (大小: {file_size} 字节)")
-                return True
-                
-            except requests.exceptions.RequestException as e:
-                self.error_stats['network_errors'] += 1
-                error_msg = f"网络请求失败 ({attempt+1}/{RETRY_COUNT+1}): {e}"
-                if self.debug:
-                    logger.debug(f"[调试] {error_msg}")
-                    import traceback
-                    logger.debug(traceback.format_exc())
-                else:
-                    logger.warning(f"  {error_msg}")
-                if attempt < RETRY_COUNT:
-                    time.sleep(1.0 * (2 ** attempt))
-                    continue
-                return False
-            except Exception as e:
-                self.error_stats['other_errors'] += 1
-                error_msg = f"下载瓦片失败 ({attempt+1}/{RETRY_COUNT+1}): {e}"
-                if self.debug:
-                    logger.debug(f"[调试] {error_msg}")
-                    import traceback
-                    logger.debug(traceback.format_exc())
-                else:
-                    logger.warning(f"  {error_msg}")
-                if attempt < RETRY_COUNT:
-                    time.sleep(1.0 * (2 ** attempt))
-                    continue
-                return False
-    
-    def download_historical_tiles_batch(self, tile_coords: List[Tuple[int, int]], zoom: int,
-                                        temp_dir: str, image_date_info: Optional[Dict] = None, 
-                                        data_source_name: Optional[str] = None) -> int:
-        """批量下载历史影像瓦片
+        self.session.verify = False
+        # 线程池大小来自 config；fallback 为 10（与 config.py 中默认值一致）
+        self.thread_pool_size = THREAD_POOL_SIZE or 10
+        self._downloaded_hashes = set()         # 字节级 MD5：100% 精确重复
+        self._downloaded_dhashes: set = set()   # 感知级 dHash(int)：视觉重复
+        self._probe_tile_dhashes: Dict[str, int] = {}  # 预筛：(坐标zoom -> release_id -> tile dhash)
+        self._diag_done: set = set()            # zoom×buffer 诊断节流：(zoom,lat1,lon1,buf)
+        self._wayback_tile_url_template = self.WAYBACK_TILE_URL_TEMPLATE
 
-        参数:
-            tile_coords: 瓦片坐标列表
-            zoom: 缩放级别
-            temp_dir: 临时目录
-            image_date_info: 影像日期信息，包含id和url_template或hex_date/epoch
-            data_source_name: 数据源名称，如不指定则使用第一个服务
-        """
-        self.downloaded_count = 0
-        total_tiles = len(tile_coords)
-        failed_tiles = 0
-        skipped_tiles = 0
+        # 启动时自动清理根目录残留的 temp_tiles_*/ 临时瓦片目录
+        self._cleanup_residual_temp_tiles()
 
-        logger.info(f"开始处理 {total_tiles} 个瓦片的历史影像下载")
-        logger.info(f"缩放级别: {zoom}")
-        logger.info(f"临时目录: {temp_dir}")
-
-        use_ge_api = (image_date_info and image_date_info.get('source') == 'google_earth_api')
-        
-        if use_ge_api:
-            hex_date = image_date_info.get('hex_date', '')
-            epoch = image_date_info.get('epoch', 0)
-            date_str = image_date_info.get('date', 'unknown')
-            name = image_date_info.get('name', 'Historical Imagery')
-            logger.info("使用Google Earth Flatfile API下载历史影像")
-            logger.info(f"  日期: {date_str}, 名称: {name}")
-            logger.info(f"  hex_date: {hex_date}, epoch: {epoch}")
-            
-            if not self.ge_client.initialize():
-                logger.error("Google Earth客户端初始化失败，无法下载历史影像")
-                return 0
-            
-            tasks = []
-            for x, y in tile_coords:
-                tile_path = os.path.join(temp_dir, f"tile_{x}_{y}_{zoom}.png")
-                
-                if os.path.exists(tile_path) and os.path.getsize(tile_path) > 100:
-                    logger.debug(f"  瓦片 {x},{y} 已存在，跳过下载")
-                    skipped_tiles += 1
-                    with self.lock:
-                        self.downloaded_count += 1
-                    continue
-                
-                tasks.append((x, y, tile_path, hex_date, epoch, zoom))
-            
-            actual_tiles_to_download = len(tasks)
-            logger.info(f"跳过 {skipped_tiles} 个已存在的瓦片，实际需要下载 {actual_tiles_to_download} 个瓦片")
-            
-            if actual_tiles_to_download == 0:
-                return self.downloaded_count
-            
-            logger.info(f"开始下载 {actual_tiles_to_download} 个瓦片 (Google Earth API)...")
-            
-            def ge_download_task(x, y, tile_path, h_date, ep, z):
-                return self.ge_client.download_historical_tile(x, y, z, h_date, ep, tile_path)
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.thread_pool_size, 5)) as executor:
-                future_to_tile = {
-                    executor.submit(ge_download_task, x, y, path, h_date, ep, z): (x, y)
-                    for x, y, path, h_date, ep, z in tasks
-                }
-                
-                completed = 0
-                for future in concurrent.futures.as_completed(future_to_tile):
-                    tile_coord = future_to_tile[future]
-                    completed += 1
-                    try:
-                        result = future.result()
-                        if result:
-                            with self.lock:
-                                self.downloaded_count += 1
-                        else:
-                            failed_tiles += 1
-                            logger.warning(f"  瓦片 {tile_coord} 下载失败")
-                    except Exception as e:
-                        failed_tiles += 1
-                        logger.error(f"  瓦片 {tile_coord} 下载异常: {e}")
-                    
-                    if completed % 10 == 0 or completed == actual_tiles_to_download:
-                        progress = (completed / actual_tiles_to_download) * 100
-                        logger.info(f"  进度: {completed}/{actual_tiles_to_download} ({progress:.1f}%)")
-            
-            success_rate = (self.downloaded_count / total_tiles) * 100 if total_tiles > 0 else 0
-            logger.info("\n=== 下载完成 ===")
-            logger.info(f"总瓦片数: {total_tiles}")
-            logger.info(f"成功下载: {self.downloaded_count}")
-            logger.info(f"失败下载: {failed_tiles}")
-            logger.info(f"成功率: {success_rate:.1f}%")
-            print("================")
-            
-            return self.downloaded_count
-
-        download_configs = []
-        
-        if image_date_info and image_date_info.get('url_template'):
-            version_id = image_date_info.get('id', 'unknown')
-            date_str = image_date_info.get('date', 'unknown')
-            name = image_date_info.get('name', 'Historical Imagery')
-            source = image_date_info.get('source', 'unknown')
-            logger.info(f"下载历史影像（版本ID: {version_id}, 日期: {date_str}, 名称: {name}, 来源: {source}")
-            
-            primary_url_template = image_date_info['url_template']
-            logger.info(f"使用主要URL模板: {primary_url_template}")
-            
-            if source == 'wayback':
-                backup_url_templates = []
-                for wb_service in self.wayback_services:
-                    if wb_service.get('id') != version_id:
-                        backup_url_templates.append({
-                            'url_template': wb_service['url_template'],
-                            'date': wb_service['date'],
-                            'id': wb_service['id']
-                        })
-                headers = {
-                    'User-Agent': self.get_random_user_agent(),
-                    'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                    'Referer': 'https://www.arcgis.com/'
-                }
-            else:
-                backup_url_templates = []
-                headers = {
-                    'User-Agent': self.get_random_user_agent(),
-                    'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-                    'Referer': 'https://www.google.com/'
-                }
-        else:
-            print("错误: 缺少影像日期信息，无法下载历史影像")
-            return 0
-
-        headers['Accept-Encoding'] = 'gzip, deflate, br'
-        headers['Connection'] = 'keep-alive'
-        headers['Cache-Control'] = 'no-cache'
-        headers['Pragma'] = 'no-cache'
-
-        logger.debug(f"使用Headers: User-Agent={headers.get('User-Agent', 'N/A')}")
-
-        tasks = []
-        for x, y in tile_coords:
-            tile_path = os.path.join(temp_dir, f"tile_{x}_{y}_{zoom}.png")
-            
-            if os.path.exists(tile_path) and os.path.getsize(tile_path) > 100:
-                    logger.debug(f"  瓦片 {x},{y} 已存在，跳过下载")
-                    skipped_tiles += 1
-                    with self.lock:
-                        self.downloaded_count += 1
-                    continue
-            
-            urls = []
-            url_infos = []
-            
-            try:
-                primary_url = primary_url_template.format(z=zoom, x=x, y=y)
-                urls.append(primary_url)
-                url_infos.append({'url': primary_url, 'date': date_str, 'id': version_id})
-                
-                for backup_info in backup_url_templates:
-                    try:
-                        backup_template = backup_info['url_template']
-                        backup_url = backup_template.format(z=zoom, x=x, y=y)
-                        urls.append(backup_url)
-                        url_infos.append({'url': backup_url, 'date': backup_info['date'], 'id': backup_info['id']})
-                    except Exception as e:
-                        logger.error(f"  构建备用URL时出错: {e}")
-                        continue
-                
-                logger.debug(f"  瓦片 {x},{y}: 准备 {len(urls)} 个URL")
-                tasks.append((x, y, tile_path, urls, headers, url_infos))
-                
-            except KeyError as e:
-                logger.error(f"  URL模板格式化错误: {e}")
-                logger.error(f"  模板: {primary_url_template}")
-                logger.error(f"  跳过瓦片 {x},{y} 下载")
-                failed_tiles += 1
-            except Exception as e:
-                logger.error(f"  生成瓦片URL时出错: {e}")
-                logger.error(f"  跳过瓦片 {x},{y} 下载")
-                failed_tiles += 1
-
-        actual_tiles_to_download = len(tasks)
-        logger.info(f"跳过 {skipped_tiles} 个已存在的瓦片，实际需要下载 {actual_tiles_to_download} 个瓦片")
-
-        if actual_tiles_to_download == 0:
-            logger.info("所有瓦片都已存在，无需下载")
-            return self.downloaded_count
-
-        logger.info(f"开始下载 {actual_tiles_to_download} 个瓦片...")
-        logger.info(f"使用线程池大小: {self.thread_pool_size}")
-
-        def download_with_fallback(x, y, tile_path, urls, headers, url_infos):
-            """使用多个URL尝试下载瓦片"""
-            for url_index, url in enumerate(urls):
-                info = url_infos[url_index] if url_index < len(url_infos) else {}
-                date_info = info.get('date', 'unknown')
-                id_info = info.get('id', 'unknown')
-                logger.debug(f"  瓦片 {x},{y}: 尝试下载 ({url_index + 1}/{len(urls)}) - 日期: {date_info}, ID: {id_info}")
-                logger.debug(f"    URL: {url}")
-                try:
-                    success = self.download_tile_worker_with_url(url, tile_path, headers)
-                    if success:
-                        logger.debug(f"  瓦片 {x},{y}: 下载成功 (使用日期: {date_info})")
-                        return True, info
-                    else:
-                        logger.warning(f"  瓦片 {x},{y}: URL {url_index + 1} 下载失败，尝试下一个URL")
-                except Exception as e:
-                    logger.error(f"  瓦片 {x},{y}: URL {url_index + 1} 下载异常: {e}")
-                    continue
-            logger.warning(f"  瓦片 {x},{y}: 所有URL都下载失败")
-            return False, {}
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_pool_size) as executor:
-            future_to_tile = {
-                executor.submit(download_with_fallback, x, y, path, urls, hdr, infos): (x, y)
-                for x, y, path, urls, hdr, infos in tasks
-            }
-            
-            completed = 0
-            for future in concurrent.futures.as_completed(future_to_tile):
-                tile_coord = future_to_tile[future]
-                completed += 1
-                try:
-                    result, info = future.result()
-                    if not result:
-                        failed_tiles += 1
-                        logger.warning(f"  瓦片 {tile_coord} 最终下载失败")
-                    else:
-                        with self.lock:
-                            self.downloaded_count += 1
-                except Exception as e:
-                    failed_tiles += 1
-                    logger.error(f"  瓦片 {tile_coord} 下载异常: {e}")
-                
-                if completed % 10 == 0 or completed == actual_tiles_to_download:
-                    progress = (completed / actual_tiles_to_download) * 100
-                    logger.info(f"  进度: {completed}/{actual_tiles_to_download} ({progress:.1f}%)")
-
-        success_rate = (self.downloaded_count / total_tiles) * 100 if total_tiles > 0 else 0
-        actual_success_rate = (self.downloaded_count - skipped_tiles) / actual_tiles_to_download * 100 if actual_tiles_to_download > 0 else 0
-        
-        logger.info("\n=== 下载完成 ===")
-        logger.info(f"总瓦片数: {total_tiles}")
-        logger.info(f"跳过的瓦片: {skipped_tiles}")
-        logger.info(f"实际下载: {actual_tiles_to_download}")
-        logger.info(f"成功下载: {self.downloaded_count - skipped_tiles}")
-        logger.info(f"失败下载: {failed_tiles}")
-        logger.info(f"总体成功率: {success_rate:.1f}%")
-        logger.info(f"实际下载成功率: {actual_success_rate:.1f}%")
-        print("================")
-        
-        self.print_error_stats()
-        
-        return self.downloaded_count
-    
-    def parse_kml_file(self, kml_file_path: str) -> List[Dict]:
-        """解析KML文件，提取矩形边界坐标"""
-        buffers = []
-        
-        try:
-            tree = ET.parse(kml_file_path)
-            root = tree.getroot()
-            
-            namespace = ''
-            if '}' in root.tag:
-                namespace = root.tag.split('}')[0].strip('{')
-            
-            ns = {}
-            if namespace:
-                ns['kml'] = namespace
-            
-            placemarks = []
-            if namespace:
-                placemarks = root.findall('.//kml:Placemark', namespaces=ns)
-            else:
-                placemarks = root.findall('.//Placemark')
-            
-            for placemark in placemarks:
-                buffer_info = {}
-                
-                buffer_id = placemark.get('id', '')
-                buffer_info['id'] = buffer_id
-                
-                extended_data = None
-                if namespace:
-                    extended_data = placemark.find('.//kml:ExtendedData', namespaces=ns)
-                else:
-                    extended_data = placemark.find('.//ExtendedData')
-                
-                if extended_data is not None:
-                    schema_data = None
-                    if namespace:
-                        schema_data = extended_data.find('.//kml:SchemaData', namespaces=ns)
-                    else:
-                        schema_data = extended_data.find('.//SchemaData')
-                    
-                    if schema_data is not None:
-                        simple_data_list = []
-                        if namespace:
-                            simple_data_list = schema_data.findall('.//kml:SimpleData', namespaces=ns)
-                        else:
-                            simple_data_list = schema_data.findall('.//SimpleData')
-                        
-                        for simple_data in simple_data_list:
-                            name = simple_data.get('name')
-                            value = simple_data.text
-                            if name and value:
-                                buffer_info[name] = value
-                
-                coordinates_elem = None
-                if namespace:
-                    coordinates_elem = placemark.find('.//kml:coordinates', namespaces=ns)
-                else:
-                    coordinates_elem = placemark.find('.//coordinates')
-                if coordinates_elem is not None and coordinates_elem.text:
-                    coords_text = coordinates_elem.text.strip()
-                    coords_list = re.findall(r'[-+]?[0-9]*\.?[0-9]+,[-+]?[0-9]*\.?[0-9]+', coords_text)
-                    
-                    if len(coords_list) >= 4:
-                        lons = []
-                        lats = []
-                        for coord in coords_list:
-                            lon, lat = map(float, coord.split(','))
-                            lons.append(lon)
-                            lats.append(lat)
-                        
-                        buffer_info['min_lon'] = min(lons)
-                        buffer_info['max_lon'] = max(lons)
-                        buffer_info['min_lat'] = min(lats)
-                        buffer_info['max_lat'] = max(lats)
-                        buffer_info['center_lon'] = (buffer_info['min_lon'] + buffer_info['max_lon']) / 2
-                        buffer_info['center_lat'] = (buffer_info['min_lat'] + buffer_info['max_lat']) / 2
-                        
-                        buffers.append(buffer_info)
-            
-            logger.info(f"成功解析 {len(buffers)} 个矩形边界")
-            return buffers
-        except Exception as e:
-            logger.error(f"解析KML文件时出错: {e}")
-            return []
-    
+    # ------------------------------------------------------------------
+    # 瓦片坐标 / 边界计算
+    # ------------------------------------------------------------------
     @staticmethod
     def latlon_to_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int]:
-        """将经纬度转换为瓦片坐标"""
         lat_rad = math.radians(lat)
         n = 2.0 ** zoom
         xtile = int((lon + 180.0) / 360.0 * n)
-        ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+        ytile = int(
+            (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi)
+            / 2.0 * n
+        )
         return xtile, ytile
-    
-    def calculate_zoom_level(self, lat_min: float, lat_max: float, lon_min: float, lon_max: float, tile_size: int = 512) -> int:
-        """计算合适的缩放级别"""
-        from config import PROCESSING
-        
-        lat_span = abs(lat_max - lat_min)
-        lon_span = abs(lon_max - lon_min)
-        
-        default_zoom = PROCESSING.get('default_zoom', 15)
-        max_zoom = PROCESSING.get('max_zoom', 19)
-        min_zoom = PROCESSING.get('min_zoom', 1)
-        
-        default_zoom = max(min_zoom, min(default_zoom, max_zoom))
-        
-        center_lat = (lat_min + lat_max) / 2
-        center_lon = (lon_min + lon_max) / 2
-        
-        x1, y1 = self.latlon_to_tile(lat_min, lon_min, default_zoom)
-        x2, y2 = self.latlon_to_tile(lat_max, lon_max, default_zoom)
-        
-        tiles_width = abs(x2 - x1) + 1
-        tiles_height = abs(y2 - y1) + 1
-        
-        earth_circumference = 40075016.686
-        meters_per_pixel = earth_circumference / (tile_size * (2 ** default_zoom))
-        
-        current_lat_span = tiles_height * tile_size * meters_per_pixel / 111320
-        current_lon_span = tiles_width * tile_size * meters_per_pixel / (111320 * math.cos(math.radians(center_lat)))
-        
-        if current_lat_span >= lat_span and current_lon_span >= lon_span:
-            return default_zoom
-        
-        for zoom in range(default_zoom + 1, max_zoom + 1):
-            x1, y1 = self.latlon_to_tile(lat_min, lon_min, zoom)
-            x2, y2 = self.latlon_to_tile(lat_max, lon_max, zoom)
-            
-            tiles_width = abs(x2 - x1) + 1
-            tiles_height = abs(y2 - y1) + 1
-            
-            meters_per_pixel = earth_circumference / (tile_size * (2 ** zoom))
-            
-            current_lat_span = tiles_height * tile_size * meters_per_pixel / 111320
-            current_lon_span = tiles_width * tile_size * meters_per_pixel / (111320 * math.cos(math.radians(center_lat)))
-            
-            if current_lat_span >= lat_span and current_lon_span >= lon_span:
-                return zoom
-        
-        for zoom in range(default_zoom - 1, min_zoom - 1, -1):
-            x1, y1 = self.latlon_to_tile(lat_min, lon_min, zoom)
-            x2, y2 = self.latlon_to_tile(lat_max, lon_max, zoom)
-            
-            tiles_width = abs(x2 - x1) + 1
-            tiles_height = abs(y2 - y1) + 1
-            
-            meters_per_pixel = earth_circumference / (tile_size * (2 ** zoom))
-            
-            current_lat_span = tiles_height * tile_size * meters_per_pixel / 111320
-            current_lon_span = tiles_width * tile_size * meters_per_pixel / (111320 * math.cos(math.radians(center_lat)))
-            
-            if current_lat_span >= lat_span and current_lon_span >= lon_span:
-                return zoom
-        
-        return default_zoom
-    
-    def download_tile_worker(self, service: Dict, x: int, y: int, zoom: int, save_path: str) -> bool:
-        """下载单个瓦片"""
-        url_template = service['url_template']
-        
-        if '{quadkey}' in url_template:
-            quadkey = self.tile_to_quadkey(x, y, zoom)
-            url = url_template.format(quadkey=quadkey)
-        elif '{q}' in url_template:
-            quadkey = self.tile_to_quadkey(x, y, zoom)
-            url = url_template.format(q=quadkey, z=zoom, x=x, y=y)
-        elif '{s}' in url_template:
-            subdomain = random.choice(self.osm_subdomains)
-            url = url_template.format(s=subdomain, z=zoom, x=x, y=y)
+
+    @staticmethod
+    def tile_to_lonlat(x: int, y: int, zoom: int) -> Tuple[float, float]:
+        """瓦片 (x, y) 左上角的 WGS84 经纬度"""
+        n = 2.0 ** zoom
+        lon = x / n * 360.0 - 180.0
+        lat_rad = math.atan(math.sinh(math.pi * (1 - 2.0 * y / n)))
+        lat = math.degrees(lat_rad)
+        return lon, lat
+
+    def get_tile_coords(self, lat: float, lon: float, zoom: int,
+                        buffer_size: int = 500) -> Tuple[int, int, int, int]:
+        """计算覆盖 (lat, lon) ± buffer 米 范围所需的瓦片坐标范围。
+
+        返回 (x_min, x_max, y_min, y_max)，其中：
+        - x_min/x_max 包含两端（含）
+        - y_min 是 tile y 的较小值（对应更北 / 更大纬度）
+        - y_max 是 tile y 的较大值（对应更南 / 更小纬度）
+
+        注意：
+            最终下载范围 = 瓦片拼接后的整块矩形，其大小受 ``zoom`` 级别决定。
+            例如 zoom=12 单瓦片在 35°N 约覆盖 16km(EW) × 8km(NS)，
+            此时即使 buffer=200m，最终输出也必然 ≥ 单瓦片尺寸。
+            若用户希望"输出范围约等于 buffer"，请选择 zoom ≥ 17。
+        """
+        # ----- 入参硬断言：防止「米被当成度 / 级别当成米」这种灾难级错误 -----
+        if not (-90.0 <= lat <= 90.0):
+            raise ValueError(f"lat 越界 {lat}，必须 ∈ [-90, 90]")
+        if not (-180.0 <= lon <= 180.0):
+            raise ValueError(f"lon 越界 {lon}，必须 ∈ [-180, 180]")
+        if not isinstance(zoom, int) or not (1 <= zoom <= 22):
+            # Esri Wayback 实测支持到 z≤20，这里上限稍微放宽做防御
+            raise ValueError(f"zoom 越界 {zoom!r}，必须为 1..22 的整数")
+        if not isinstance(buffer_size, int) or not (10 <= buffer_size <= 200000):
+            raise ValueError(f"buffer_size 越界 {buffer_size!r}，必须为 10..200000 的整数（米）")
+
+        # 经度方向按纬度做 cos 修正，保证东西向距离正确
+        cos_lat = max(math.cos(math.radians(lat)), 1e-6)
+        half_lon_deg = (buffer_size / 2) / (111320.0 * cos_lat)
+        half_lat_deg = (buffer_size / 2) / 111320.0
+
+        # ----- 防「buffer_size 被当成度」的二次防线 -----
+        # 合法 buffer_size（米）换算后的半纬范围，即使 200km 也只有 ~1.8°；
+        # 一旦超过 5°，只可能是「buffer 被当成度」或调用链把 zoom/buffer 传反了。
+        if half_lat_deg > 5.0:
+            raise ValueError(
+                f"buffer_size 换算异常：half_lat_deg={half_lat_deg:.4f}° 过大，"
+                f"请确认 buffer_size={buffer_size} 的单位是否为米、"
+                f"以及调用时 zoom={zoom} 与 buffer_size 位置是否反传。"
+            )
+
+        # ----- zoom×buffer 合理性诊断（首次触发时打印一次） -----
+        self._log_zoom_buffer_diagnostic(lat, lon, zoom, buffer_size, cos_lat)
+
+        # 四个角点
+        sx_tile, sy_tile = self.latlon_to_tile(lat - half_lat_deg, lon - half_lon_deg, zoom)
+        nx_tile, ny_tile = self.latlon_to_tile(lat + half_lat_deg, lon + half_lon_deg, zoom)
+
+        x_min, x_max = min(sx_tile, nx_tile), max(sx_tile, nx_tile)
+        # 在 Web Mercator 中，纬度越高 y 越小，因此 y_min = 较大纬度对应的瓦片
+        y_min, y_max = min(sy_tile, ny_tile), max(sy_tile, ny_tile)
+        return x_min, x_max, y_min, y_max
+
+    def _log_zoom_buffer_diagnostic(self, lat: float, lon: float, zoom: int,
+                                    buffer_size: int, cos_lat: float) -> None:
+        """首次调用时打印 zoom / buffer 与地面覆盖的对应关系，异常时 WARNING。
+        节流键：同一 (zoom, round(lat,1), round(lon,1), buffer_size) 只打印一次。
+        """
+        key = (zoom, round(lat, 1), round(lon, 1), buffer_size)
+        already = key in self._diag_done
+        if already:
+            return
+
+        # 估算该 zoom 级单瓦片在 (lat, lon) 附近的大致地面覆盖尺寸
+        n = 2.0 ** zoom
+        one_tile_lon_deg = 360.0 / n
+        # 纬度方向用相邻两张瓦片的纬度差近似（Mercator 非线性，但取局部差足够）
+        x_tile, y_tile = self.latlon_to_tile(lat, lon, zoom)
+        _lon1, lat_top = self.tile_to_lonlat(x_tile, y_tile, zoom)
+        _lon2, lat_bot = self.tile_to_lonlat(x_tile, y_tile + 1, zoom)
+        one_tile_ns_m = abs(lat_top - lat_bot) * 111320.0
+        one_tile_ew_m = one_tile_lon_deg * 111320.0 * cos_lat
+
+        # 单瓦片覆盖 与 buffer 的比值（判断 buffer 是否有意义）
+        ratio_ns = one_tile_ns_m / max(buffer_size, 1)
+        ratio_ew = one_tile_ew_m / max(buffer_size, 1)
+        ratio = max(ratio_ns, ratio_ew)
+
+        msg = (
+            f"[瓦片粒度诊断] zoom={zoom}, buffer={buffer_size}m, "
+            f"单瓦片≈ {one_tile_ew_m:.0f}m(EW) × {one_tile_ns_m:.0f}m(NS)；"
+        )
+        if ratio <= 4.0:
+            logger.info(msg + f"单瓦片/缓冲 ≈ {ratio:.1f}×，覆盖范围将与 buffer 匹配 ✓")
+        elif ratio <= 20.0:
+            logger.warning(
+                msg
+                + f"单瓦片/缓冲 ≈ {ratio:.1f}×，最终输出 ≈ 单瓦片粒度（比 buffer 大）。"
+                + " 若希望更小范围，请提高 zoom。"
+            )
         else:
-            url = url_template.format(z=zoom, x=x, y=y)
-        
-        headers = service.get('headers', {}).copy()
-        if 'User-Agent' not in headers:
-            headers['User-Agent'] = self.get_random_user_agent()
-        headers['Accept-Encoding'] = 'gzip, deflate, br'
-        headers['Connection'] = 'keep-alive'
-        
-        for attempt in range(RETRY_COUNT + 1):
+            logger.warning(
+                msg
+                + f"单瓦片/缓冲 ≈ {ratio:.0f}×！！！"
+                + f" 此时 buffer={buffer_size}m 远小于 zoom={zoom} 的瓦片粒度，"
+                + " 输出影像将覆盖 10+km 级别的范围（与 buffer 数值完全不匹配）。"
+                + " 请大幅提高 zoom 级别（建议 zoom ≥ 17）或增大 buffer_size。"
+            )
+        self._diag_done.add(key)
+
+    def _tile_bounds_wgs84(self, x_min: int, x_max: int, y_min: int, y_max: int,
+                          zoom: int) -> Tuple[float, float, float, float]:
+        """基于瓦片四角精确计算覆盖范围的 WGS84 边界。
+
+        返回 (min_lon, min_lat, max_lon, max_lat)。
+        """
+        # y_min 是更靠北的瓦片（更小 y），其顶边 = max_lat
+        # y_max 是更靠南的瓦片（更大 y），其底边 = min_lat
+        lon_nw, lat_nw = self.tile_to_lonlat(x_min, y_min, zoom)
+        lon_se, lat_se = self.tile_to_lonlat(x_max + 1, y_max + 1, zoom)
+        min_lon = lon_nw
+        max_lon = lon_se
+        max_lat = lat_nw
+        min_lat = lat_se
+        return min_lon, min_lat, max_lon, max_lat
+
+    @staticmethod
+    def _buffer_wgs84_rect(lat: float, lon: float,
+                           buffer_size: int) -> Tuple[float, float, float, float]:
+        """返回 (lat, lon) ± buffer 米 的 WGS84 裁剪矩形：
+        (clip_min_lon, clip_min_lat, clip_max_lon, clip_max_lat)。
+        """
+        cos_lat = max(math.cos(math.radians(lat)), 1e-6)
+        half_lon = (buffer_size / 2.0) / (111320.0 * cos_lat)
+        half_lat = (buffer_size / 2.0) / 111320.0
+        clip_min_lon = lon - half_lon
+        clip_max_lon = lon + half_lon
+        clip_min_lat = lat - half_lat  # 更南
+        clip_max_lat = lat + half_lat  # 更北
+        return clip_min_lon, clip_min_lat, clip_max_lon, clip_max_lat
+
+    def _crop_png_to_wgs84_rect(self,
+                                png_path: str,
+                                canvas_bounds: Tuple[float, float, float, float],
+                                clip_rect: Tuple[float, float, float, float],
+                                ) -> Tuple[Dict[str, float], Tuple[int, int, int, int], bool]:
+        """按 WGS84 裁剪矩形裁剪 PNG 文件（原地覆盖写回）。
+
+        Args:
+            png_path      : 待裁剪的 PNG（通常是整张瓦片拼接图）。
+            canvas_bounds : 该 PNG 对应的 WGS84 边界 (min_lon, min_lat, max_lon, max_lat)。
+            clip_rect     : 用户想要的裁剪矩形 (min_lon, min_lat, max_lon, max_lat)。
+
+        Returns:
+            (new_bounds, px_box, did_crop) ——
+                new_bounds: 裁剪后实际的 WGS84 边界字典（已按图像像素做整数对齐，
+                            可能与 clip_rect 差 ±1 像素对应的度数）。
+                px_box    : (left, top, right, bottom) 实际裁剪的像素 box（若未裁剪则为整图 (0,0,w,h)）。
+                did_crop  : True 表示实际发生了裁剪（图像尺寸变小）；
+                            False 表示 clip_rect 已与画布接近全同，未动文件。
+        """
+        c_min_lon, c_min_lat, c_max_lon, c_max_lat = canvas_bounds
+        k_min_lon, k_min_lat, k_max_lon, k_max_lat = clip_rect
+
+        # --- 与画布求交集（防御性：裁剪矩形不应超出 PNG 地理覆盖） ---
+        #   命名统一：min_lon=西（小经度/左）、max_lon=东（大经度/右）、
+        #            min_lat=南（小纬度/下）、max_lat=北（大纬度/上）
+        i_min_lon = max(c_min_lon, k_min_lon)   # 交集西边界 = 两者西边中更东的那个
+        i_max_lon = min(c_max_lon, k_max_lon)   # 交集东边界 = 两者东边中更西的那个
+        i_min_lat = max(c_min_lat, k_min_lat)   # 交集南边界 = 两者南边中更北的那个（数值更大）
+        i_max_lat = min(c_max_lat, k_max_lat)   # 交集北边界 = 两者北边中更南的那个（数值更小）
+        # 判空：西 ≥ 东  或  南 ≥ 北
+        if i_max_lon <= i_min_lon or i_min_lat >= i_max_lat:
+            raise ValueError(
+                f"裁剪矩形与画布无交集：clip={clip_rect}, canvas={canvas_bounds}"
+            )
+
+        with Image.open(png_path) as img:
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            w, h = img.size
+            lon_per_px = (c_max_lon - c_min_lon) / float(w)
+            lat_per_px = (c_max_lat - c_min_lat) / float(h)  # >0（度/像素向下）
+
+            # 图像左上角 = (c_min_lon, c_max_lat)，向下 y+ → 纬度减小
+            px_left_f   = (i_min_lon - c_min_lon) / lon_per_px
+            px_right_f  = (i_max_lon - c_min_lon) / lon_per_px
+            px_top_f    = (c_max_lat - i_max_lat) / lat_per_px   # max_lat 为更北（图像顶部），减去大纬度得 top
+            px_bottom_f = (c_max_lat - i_min_lat) / lat_per_px   # 减去小纬度得到 bottom（更大 y）
+
+            # --- 判断是否"基本没裁"：交集 ≈ 画布（<1px 差异）就直接跳过 ---
+            no_crop_east  = (abs(px_left_f)       < 0.95) and (abs(w - px_right_f)  < 0.95)
+            no_crop_north = (abs(px_top_f)        < 0.95) and (abs(h - px_bottom_f) < 0.95)
+            if no_crop_east and no_crop_north:
+                new_bounds = {
+                    'min_lon': c_min_lon, 'min_lat': c_min_lat,
+                    'max_lon': c_max_lon, 'max_lat': c_max_lat,
+                }
+                return new_bounds, (0, 0, w, h), False
+
+            # --- 像素取整（floor(左/上)、ceil(右/下) 保证覆盖 clip 矩形，±1px 无差） ---
+            px_left   = max(0, int(math.floor(px_left_f)))
+            px_top    = max(0, int(math.floor(px_top_f)))
+            px_right  = min(w, int(math.ceil(px_right_f)))
+            px_bottom = min(h, int(math.ceil(px_bottom_f)))
+            # 保证 1px 以上尺寸
+            px_right  = max(px_right,  px_left   + 1)
+            px_bottom = max(px_bottom, px_top    + 1)
+
+            cropped = img.crop((px_left, px_top, px_right, px_bottom))
+            cropped.save(png_path, 'PNG')
+            new_w, new_h = cropped.size
+            cropped.close()
+
+        # 按裁剪后实际像素反推 WGS84 边界（与整数像素对齐，避免 ±半度浮点缝）
+        new_min_lon = c_min_lon + px_left  * lon_per_px
+        new_max_lon = c_min_lon + px_right * lon_per_px
+        new_max_lat = c_max_lat - px_top    * lat_per_px
+        new_min_lat = c_max_lat - px_bottom * lat_per_px
+
+        new_bounds = {
+            'min_lon': new_min_lon, 'min_lat': new_min_lat,
+            'max_lon': new_max_lon, 'max_lat': new_max_lat,
+        }
+        return new_bounds, (px_left, px_top, px_right, px_bottom), True
+
+    # ------------------------------------------------------------------
+    # ESRI 在线 release 列表
+    # ------------------------------------------------------------------
+    def _fetch_wayback_releases(self) -> Optional[List[Dict]]:
+        """从 ESRI 官方 endpoint 动态获取 wayback release 列表。
+
+        Endpoint: GET WAYBACK_METADATA_URL（world_imagery/MapServer?f=json）
+        响应 JSON 结构（实测确认）：
+            {"Service": "Wayback", "Selection": [ ... ]}
+        其中 Selection 为 release 列表（按日期降序，最新在前），每项形如：
+            {"Name": "World Imagery (Wayback 2026-08-05)",
+             "M": "26334",
+             "ID": "WB_2026_R07"}
+        - M   : 瓦片 URL 中使用的数字 ID（即 wayback_id）
+        - Name: 展示名，其中含发布日期 "Wayback YYYY-MM-DD"
+        - ID  : 发布代号（如 WB_2026_R07）
+
+        网络不可达 / 解析失败时返回 None，调用方回退到 KNOWN_WAYBACK_VERSIONS。
+        """
+        try:
+            resp = self.session.get(self.WAYBACK_METADATA_URL, timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"wayback 元数据返回 HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"无法获取 wayback 元数据: {e}")
+            return None
+
+        selection = data.get('Selection')
+        if not isinstance(selection, list) or not selection:
+            logger.warning("wayback 元数据缺少 Selection 列表，无法解析 release")
+            return None
+
+        # Name 形如 "World Imagery (Wayback 2026-08-05)"
+        date_pattern = re.compile(r'Wayback[ \(](\d{4}-\d{2}-\d{2})\)')
+        releases = []
+        for item in selection:
+            name = str(item.get('Name', ''))
+            m_id = str(item.get('M', '')).strip()
+            if not m_id:
+                continue
+            m = date_pattern.search(name)
+            date_str = m.group(1) if m else '1970-01-01'
+            releases.append({
+                'id': m_id,
+                'date': date_str,
+                'name': name,
+                'release_id': str(item.get('ID', '')),
+                'source': 'wayback-online',
+            })
+
+        if not releases:
+            logger.warning("wayback Selection 中未解析出任何 release id")
+            return None
+
+        return releases
+
+    def get_available_dates(self, lat: float, lon: float, zoom: int = 18) -> List[Dict]:
+        # 入参校验
+        if not (-90.0 <= lat <= 90.0):
+            raise ValueError(f"lat 越界: {lat}")
+        if not (-180.0 <= lon <= 180.0):
+            raise ValueError(f"lon 越界: {lon}")
+        if not (1 <= zoom <= 20):
+            raise ValueError(f"zoom 越界: {zoom}")
+
+        logger.info(f"查询坐标 ({lat:.6f}, {lon:.6f}) 的可用历史影像...")
+
+        # 在线列表优先
+        online = self._fetch_wayback_releases()
+        if online:
+            logger.info(f"在线元数据返回 {len(online)} 个 release")
+            result = online
+        else:
+            logger.warning("在线元数据不可用，回退到 KNOWN_WAYBACK_VERSIONS")
+            result = [
+                {'id': v['id'], 'date': v['date'], 'name': v['date'], 'source': 'wayback'}
+                for v in KNOWN_WAYBACK_VERSIONS
+            ]
+
+        # 统一按日期升序（最早的在前），使输出子文件夹按时间线排列
+        result.sort(key=lambda d: d['date'])
+
+        logger.info(f"找到 {len(result)} 个版本")
+        return result
+
+    # ------------------------------------------------------------------
+    # 瓦片下载
+    # ------------------------------------------------------------------
+    def _resolve_tile_url(self, wayback_id: str, z: int, y: int, x: int) -> str:
+        """构造瓦片 URL。优先用动态模板，失败时使用 fallback 模板。"""
+        template = self._wayback_tile_url_template or self.WAYBACK_TILE_URL_FALLBACK
+        try:
+            return template.format(wayback_id=wayback_id, z=z, y=y, x=x)
+        except KeyError:
+            return self.WAYBACK_TILE_URL_FALLBACK.format(
+                wayback_id=wayback_id, z=z, y=y, x=x
+            )
+
+    def download_tiles_batch(self, tile_coords: List[Tuple[int, int]], zoom: int,
+                             temp_dir: str, wayback_id: str = None) -> int:
+        """并发下载瓦片，返回成功下载数（包含本地已缓存的）。"""
+        downloaded = [0]
+        headers = {'User-Agent': 'Mozilla/5.0'}
+
+        def download_one(x, y, z, save_path):
             try:
-                response = self.session.get(
-                    url,
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
-                    stream=True,
-                    verify=True
-                )
-                response.raise_for_status()
-                
-                with open(save_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                
-                with self.lock:
-                    self.downloaded_count += 1
-                return True
-                
-            except Exception as e:
-                if attempt < RETRY_COUNT:
-                    time.sleep(0.1 * (2 ** attempt))
-                    continue
-                logger.error(f"下载瓦片 {x}_{y}_{zoom} 失败（尝试{attempt+1}次）: {e}")
-                return False
-    
-    def download_tiles_batch(self, service: Dict, tile_coords: List[Tuple[int, int]], zoom: int, temp_dir: str) -> int:
-        """批量下载瓦片"""
-        self.downloaded_count = 0
-        total_tiles = len(tile_coords)
-        failed_tiles = 0
-        
-        logger.info(f"开始批量下载瓦片: 共{total_tiles}个瓦片，使用服务: {service.get('name', 'Unknown')}")
-        
+                if wayback_id:
+                    url = self._resolve_tile_url(wayback_id, z, y, x)
+                else:
+                    url = (
+                        f"https://server.arcgisonline.com/arcgis/rest/services/"
+                        f"World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                    )
+                resp = self.session.get(url, headers=headers, timeout=60)
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    with open(save_path, 'wb') as f:
+                        f.write(resp.content)
+                    downloaded[0] += 1
+                else:
+                    # 失败时清理半成品文件
+                    if os.path.exists(save_path):
+                        try:
+                            os.remove(save_path)
+                        except OSError:
+                            pass
+            except Exception:
+                if os.path.exists(save_path):
+                    try:
+                        os.remove(save_path)
+                    except OSError:
+                        pass
+
         tasks = []
         for x, y in tile_coords:
             tile_path = os.path.join(temp_dir, f"tile_{x}_{y}_{zoom}.png")
-            tasks.append((x, y, tile_path))
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_pool_size) as executor:
-            future_to_tile = {
-                executor.submit(self.download_tile_worker, service, x, y, zoom, path): (x, y)
-                for x, y, path in tasks
-            }
-            for future in concurrent.futures.as_completed(future_to_tile):
-                tile_coord = future_to_tile[future]
-                try:
-                    result = future.result()
-                    if not result:
-                        failed_tiles += 1
-                        logger.warning(f"  瓦片 {tile_coord} 下载失败")
-                except Exception as e:
-                    failed_tiles += 1
-                    logger.error(f"  瓦片 {tile_coord} 下载异常: {e}")
-        
-        success_rate = (self.downloaded_count / total_tiles) * 100 if total_tiles > 0 else 0
-        logger.info(f"瓦片下载完成: 成功 {self.downloaded_count}/{total_tiles} ({success_rate:.1f}%)，失败 {failed_tiles} 个")
-        return self.downloaded_count
-    
-    def stitch_tiles(self, temp_dir: str, tile_count: int, save_path: str, kml_bounds: Optional[Dict] = None) -> bool:
-        """拼接瓦片生成完整图像"""
-        try:
-            tile_files = []
-            for filename in os.listdir(temp_dir):
-                if filename.startswith('tile_') and filename.endswith('.png'):
-                    tile_files.append(os.path.join(temp_dir, filename))
-            
-            if not tile_files:
-                logger.error("未找到瓦片文件")
-                return False
-            
-            tiles_info = []
-            for tile_file in tile_files:
-                filename = os.path.basename(tile_file)
-                parts = filename.replace('tile_', '').replace('.png', '').split('_')
-                if len(parts) == 3:
-                    x, y, z = int(parts[0]), int(parts[1]), int(parts[2])
-                    tiles_info.append({'x': x, 'y': y, 'z': z, 'file': tile_file})
-            
-            if not tiles_info:
-                logger.error("无法解析瓦片坐标信息")
-                return False
-            
-            tiles_info.sort(key=lambda t: (t['y'], t['x']))
-            
-            first_tile = Image.open(tiles_info[0]['file'])
-            tile_width, tile_height = first_tile.size
-            first_tile.close()
-            
-            result_width = tile_width * tile_count
-            result_height = tile_height * tile_count
-            result_image = Image.new('RGB', (result_width, result_height))
-            
-            x_coords = [t['x'] for t in tiles_info]
-            y_coords = [t['y'] for t in tiles_info]
-            min_x, max_x = min(x_coords), max(x_coords)
-            min_y, max_y = min(y_coords), max(y_coords)
-            
-            for tile_info in tiles_info:
-                x, y = tile_info['x'], tile_info['y']
-                pos_x = (x - min_x) * tile_width
-                pos_y = (y - min_y) * tile_height
-                
-                tile_image = Image.open(tile_info['file'])
-                result_image.paste(tile_image, (pos_x, pos_y))
-                tile_image.close()
-            
-            if kml_bounds:
-                zoom = tiles_info[0]['z']
-                result_image = self.crop_to_kml_bounds(result_image, kml_bounds, min_x, min_y, zoom, tile_width, tile_height)
-            
-            result_image.save(save_path, 'PNG')
-            result_image.close()
-            
-            logger.info(f"成功拼接 {len(tiles_info)} 个瓦片，生成 {result_width}x{result_height} 像素影像")
-            return True
-            
-        except Exception as e:
-            logger.error(f"拼接瓦片时出错: {e}")
-            return False
-    
-    def crop_to_kml_bounds(self, image: Image.Image, kml_bounds: Dict, min_tile_x: int, min_tile_y: int, zoom: int, tile_width: int, tile_height: int) -> Image.Image:
-        """根据KML边界裁剪图像"""
-        try:
-            min_lon, max_lon = kml_bounds['min_lon'], kml_bounds['max_lon']
-            min_lat, max_lat = kml_bounds['min_lat'], kml_bounds['max_lat']
-            
-            logger.info(f"KML边界: 经度({min_lon:.6f} - {max_lon:.6f}), 纬度({min_lat:.6f} - {max_lat:.6f})")
-            
-            total_pixels = 256 * (2 ** zoom)
-            
-            def lon_to_pixel_x(lon, zoom):
-                return int((lon + 180.0) / 360.0 * total_pixels)
-            
-            def lat_to_pixel_y(lat, zoom):
-                lat_rad = math.radians(lat)
-                return int((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * total_pixels)
-            
-            left_pixel = lon_to_pixel_x(min_lon, zoom)
-            right_pixel = lon_to_pixel_x(max_lon, zoom)
-            top_pixel = lat_to_pixel_y(max_lat, zoom)
-            bottom_pixel = lat_to_pixel_y(min_lat, zoom)
-            
-            min_tile_left_pixel = min_tile_x * tile_width
-            min_tile_top_pixel = min_tile_y * tile_height
-            
-            left = left_pixel - min_tile_left_pixel
-            top = top_pixel - min_tile_top_pixel
-            right = right_pixel - min_tile_left_pixel
-            bottom = bottom_pixel - min_tile_top_pixel
-            
-            width, height = image.size
-            left = max(0, min(left, width - 1))
-            top = max(0, min(top, height - 1))
-            right = max(left + 1, min(right, width))
-            bottom = max(top + 1, min(bottom, height))
-            
-            if right <= left or bottom <= top:
-                logger.warning("裁剪区域无效，返回原图")
-                return image
-            
-            cropped_image = image.crop((left, top, right, bottom))
-            
-            logger.info(f"精确裁剪图像: 位置({left}, {top}, {right}, {bottom}), 尺寸({right-left}x{bottom-top})")
-            return cropped_image
-            
-        except Exception as e:
-            logger.error(f"裁剪图像时出错: {e}")
-            return image
-    
-    def download_satellite_image(self, center_lat: float, center_lon: float, zoom: int,
-                                save_path: Optional[str] = None, tile_count: int = 3, kml_bounds: Optional[Dict] = None,
-                                image_type: str = 'current', image_date_info: Optional[Dict] = None, service_name: str = None) -> bool:
-        """下载卫星影像
+            if os.path.exists(tile_path) and os.path.getsize(tile_path) > 1000:
+                downloaded[0] += 1
+            else:
+                tasks.append((x, y, zoom, tile_path))
 
-        参数:
-            center_lat: 中心纬度
-            center_lon: 中心经度
-            zoom: 缩放级别
-            save_path: 保存路径
-            tile_count: 瓦片数量
-            kml_bounds: KML边界
-            image_type: 影像类型，'current'表示当前影像，'previous'表示前一个时刻的影像
-            image_date_info: 影像日期信息，包含id和url_template
-            service_name: 服务名称，None表示使用默认服务
+        if tasks:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_pool_size) as ex:
+                list(ex.map(lambda t: download_one(*t), tasks))
+        return downloaded[0]
+
+    # ------------------------------------------------------------------
+    # 拼接
+    # ------------------------------------------------------------------
+    def stitch_tiles(self, temp_dir: str, expected_tile_count: int,
+                     save_path: str) -> Tuple[bool, int]:
+        """拼接瓦片到 PNG。
+
+        - 以实际下载到的瓦片坐标范围建画布
+        - 若缺失瓦片，抛出 IncompleteTilesError（不输出黑边图）
+        - 返回 (success, actual_count)
         """
         try:
-            if service_name:
-                service = self.get_service_by_name(service_name)
-                if not service:
-                    logger.warning(f"警告: 未找到服务 '{service_name}'，使用默认服务")
-                    service = self.services[0]
-            else:
-                service = self.services[0]
+            tile_files = [
+                f for f in os.listdir(temp_dir)
+                if f.startswith('tile_') and f.endswith('.png')
+            ]
+            if not tile_files:
+                return False, 0
 
-            max_zoom = service['max_zoom']
-            if zoom > max_zoom:
-                logger.warning(f"缩放级别 {zoom} 超过服务最大限制 {max_zoom}")
-                zoom = max_zoom
+            tiles_info = []
+            for tf in tile_files:
+                parts = tf.replace('tile_', '').replace('.png', '').split('_')
+                if len(parts) == 3:
+                    tiles_info.append({
+                        'x': int(parts[0]),
+                        'y': int(parts[1]),
+                        'file': os.path.join(temp_dir, tf)
+                    })
 
-            if kml_bounds:
-                min_lon, max_lon = kml_bounds['min_lon'], kml_bounds['max_lon']
-                min_lat, max_lat = kml_bounds['min_lat'], kml_bounds['max_lat']
+            if not tiles_info:
+                return False, 0
 
-                original_zoom = zoom
-                while zoom > 1:
-                    x_tl, y_tl = self.latlon_to_tile(max_lat, min_lon, zoom)
-                    x_tr, y_tr = self.latlon_to_tile(max_lat, max_lon, zoom)
-                    x_bl, y_bl = self.latlon_to_tile(min_lat, min_lon, zoom)
-                    x_br, y_br = self.latlon_to_tile(min_lat, max_lon, zoom)
+            # 使用实际下载到的瓦片坐标范围
+            min_x = min(t['x'] for t in tiles_info)
+            max_x = max(t['x'] for t in tiles_info)
+            min_y = min(t['y'] for t in tiles_info)
+            max_y = max(t['y'] for t in tiles_info)
 
-                    x_min = min(x_tl, x_tr, x_bl, x_br)
-                    x_max = max(x_tl, x_tr, x_bl, x_br)
-                    y_min = min(y_tl, y_tr, y_bl, y_br)
-                    y_max = max(y_tl, y_tr, y_bl, y_br)
+            actual_count = len(tiles_info)
+            if actual_count < expected_tile_count:
+                # 缺失瓦片：抛错，不输出黑边 GeoTIFF
+                raise IncompleteTilesError(
+                    f"瓦片下载不完整：实际 {actual_count}/{expected_tile_count}"
+                )
 
-                    tile_count_x = x_max - x_min + 1
-                    tile_count_y = y_max - y_min + 1
+            first_tile = Image.open(tiles_info[0]['file'])
+            tw, th = first_tile.size
+            first_tile.close()
 
-                    if tile_count_x <= 10000 and tile_count_y <= 10000:
-                        break
-                    else:
-                        zoom -= 1
-                        logger.warning(f"瓦片数量过大({tile_count_x}x{tile_count_y})，降低缩放级别到{zoom}")
+            # 拼接：y_min（更北的瓦片）贴到图像顶部（y=0）
+            canvas_w = (max_x - min_x + 1) * tw
+            canvas_h = (max_y - min_y + 1) * th
+            result = Image.new('RGB', (canvas_w, canvas_h))
 
-                if original_zoom != zoom:
-                    logger.info(f"缩放级别从{original_zoom}调整到{zoom}")
+            for tile in tiles_info:
+                tile_img = Image.open(tile['file'])
+                result.paste(tile_img, ((tile['x'] - min_x) * tw, (tile['y'] - min_y) * th))
+                tile_img.close()
 
-                logger.info(f"根据KML边界计算瓦片范围: X({x_min}-{x_max}), Y({y_min}-{y_max}), 共{tile_count_x}x{tile_count_y}瓦片")
-            else:
-                center_x, center_y = self.latlon_to_tile(center_lat, center_lon, zoom)
-                x_min = center_x - tile_count // 2
-                x_max = center_x + tile_count // 2
-                y_min = center_y - tile_count // 2
-                y_max = center_y + tile_count // 2
-                tile_count_x = tile_count
-                tile_count_y = tile_count
-
-            is_historical = (image_type == 'previous')
-            if is_historical and image_date_info:
-                date_str = image_date_info.get('date', 'unknown')
-                name = image_date_info.get('name', 'Historical Imagery')
-                logger.info(f"下载历史影像（日期: {date_str}, 名称: {name}）: 中心({center_lat:.6f}, {center_lon:.6f}), "
-                      f"缩放级别{zoom}, {tile_count_x}x{tile_count_y}瓦片")
-            else:
-                logger.info(f"下载 {service['name']} 当前影像: 中心({center_lat:.6f}, {center_lon:.6f}), "
-                      f"缩放级别{zoom}, {tile_count_x}x{tile_count_y}瓦片")
-
-            if is_historical:
-                temp_dir = 'temp_tiles_previous'
-            else:
-                temp_dir = 'temp_tiles_current'
-            
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-            
-            os.makedirs(temp_dir, exist_ok=True)
-            logger.info(f"使用临时目录: {temp_dir}")
-
-            tile_coords = [(x, y) for x in range(x_min, x_max + 1) for y in range(y_min, y_max + 1)]
-            logger.info(f"生成 {len(tile_coords)} 个瓦片坐标")
-
-            if image_date_info and image_date_info.get('url_template'):
-                logger.info("开始下载影像瓦片（使用指定URL模板）...")
-                tiles_downloaded = self.download_historical_tiles_batch(tile_coords, zoom, temp_dir, image_date_info, service_name)
-            else:
-                logger.info("开始下载当前影像瓦片...")
-                tiles_downloaded = self.download_tiles_batch(service, tile_coords, zoom, temp_dir)
-
-            logger.info(f"瓦片下载完成: {tiles_downloaded}/{len(tile_coords)} 成功")
-
-            if tiles_downloaded == 0:
-                logger.error(f"错误: 所有瓦片下载失败，无法生成影像")
-                logger.error("提示: 请检查网络连接、服务URL配置和影像日期信息")
-                shutil.rmtree(temp_dir)
-                logger.info("临时目录已清理")
-                return False
-
-            if tiles_downloaded > 0 and save_path:
-                try:
-                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    logger.info(f"开始拼接瓦片，保存到: {save_path}")
-
-                    if self.stitch_tiles(temp_dir, max(tile_count_x, tile_count_y), save_path, kml_bounds):
-                        logger.info(f"影像已成功保存到: {save_path}")
-                        shutil.rmtree(temp_dir)
-                        logger.info("临时目录已清理")
-                        return True
-                    else:
-                        logger.error("错误: 瓦片拼接失败")
-                        logger.error("提示: 请检查临时目录权限和磁盘空间")
-                except Exception as e:
-                    logger.error(f"错误: 拼接瓦片时发生异常 - {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-
-            try:
-                shutil.rmtree(temp_dir)
-                logger.info("临时目录已清理")
-            except Exception as e:
-                logger.error(f"错误: 清理临时目录时发生异常 - {e}")
-            return False
+            result.save(save_path, 'PNG')
+            result.close()
+            return True, actual_count
+        except IncompleteTilesError:
+            raise
         except Exception as e:
-            logger.error(f"错误: 下载卫星影像时发生异常 - {e}")
-            try:
-                temp_dir = PATHS.get('temp_tiles_dir', 'temp_tiles')
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                    logger.info("临时目录已清理")
-            except:
-                pass
+            logger.error(f"拼接失败: {e}")
+            return False, 0
+
+    # ------------------------------------------------------------------
+    # GeoTIFF 输出
+    # ------------------------------------------------------------------
+    def png_to_geotiff(self, png_path: str, tiff_path: str,
+                       bounds: Dict) -> bool:
+        if not _RASTERIO_AVAILABLE:
+            logger.error("rasterio 不可用，无法生成 GeoTIFF（请安装 rasterio 与 expat）")
             return False
-    
-    def png_to_geotiff(self, png_path: str, tiff_path: str, bounds: Dict) -> bool:
-        """将PNG图像转换为带有地理参考的TIFF图像"""
         try:
             with Image.open(png_path) as img:
                 if img.mode != 'RGB':
                     img = img.convert('RGB')
-                
                 width, height = img.size
                 img_array = np.array(img)
-            
-            min_lon = bounds['min_lon']
-            max_lon = bounds['max_lon']
-            min_lat = bounds['min_lat']
-            max_lat = bounds['max_lat']
-            
-            transform = from_bounds(min_lon, min_lat, max_lon, max_lat, width, height)
-            
-            crs = rasterio.CRS.from_wkt(WGS84_WKT)
-            
+
+            transform = from_bounds(
+                bounds['min_lon'], bounds['min_lat'],
+                bounds['max_lon'], bounds['max_lat'],
+                width, height
+            )
+
             with rasterio.open(
-                tiff_path,
-                'w',
-                driver='GTiff',
-                height=height,
-                width=width,
-                count=3,
-                dtype=img_array.dtype,
-                crs=crs,
-                transform=transform,
-                compress='lzw'
+                tiff_path, 'w', driver='GTiff',
+                height=height, width=width, count=3,
+                dtype=img_array.dtype, crs=rasterio.CRS.from_wkt(WGS84_WKT),
+                transform=transform, compress='lzw'
             ) as dst:
                 dst.write(img_array[:, :, 0], 1)
                 dst.write(img_array[:, :, 1], 2)
                 dst.write(img_array[:, :, 2], 3)
-            
-            logger.info(f"成功生成带地理参考的TIFF: {tiff_path}")
             return True
-            
         except Exception as e:
-            logger.error(f"转换PNG到TIFF时出错: {e}")
+            logger.error(f"转换失败: {e}")
             return False
-    
-    def process_kml_to_tiff(self, kml_file_path: str, output_dir: Optional[str] = None,
-                             download_mode: str = 'current', service_name: str = None) -> bool:
-        """处理KML文件生成TIFF图像
 
-        参数:
-            kml_file_path: KML文件路径
-            output_dir: 输出目录
-            download_mode: 下载模式，'current'表示仅当前影像，'previous'表示仅前一个时刻影像，
-                          'both'表示同时下载当前和前一个时刻影像进行对比
-            service_name: 服务名称，None表示使用默认服务
+    # ------------------------------------------------------------------
+    # 哈希（字节级 + 感知级）
+    # ------------------------------------------------------------------
+    # 感知哈希汉明距阈值：<=DHASH_DUP_THRESHOLD 即视为「视觉同一影像」。
+    # dHash16 的 256 bits 中经验上：完全相同图像=0~2；轻微压缩差异<8；同一场景不同季节一般>30。
+    DHASH_SIZE = 16
+    DHASH_DUP_THRESHOLD = 6
+    # 预筛（单瓦片）使用更宽松阈值，避免误跳：瓦片粒度细节差异更大
+    DHASH_TILE_THRESHOLD = 4
+
+    def compute_image_hash(self, image_path: str,
+                           chunk_size: int = 1 << 20) -> Optional[str]:
+        """字节级 MD5（流式，避免一次读入大文件）。命中即 100% 确定重复。"""
+        try:
+            h = hashlib.md5()
+            with open(image_path, 'rb') as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    @classmethod
+    def compute_dhash_int(cls, img) -> Optional[int]:
+        """计算 dHash（差异哈希）整数（抗 PNG 编码、JPEG 压缩、色深差异）。
+
+        img: PIL.Image（或任何已打开的图像）。内部会转为 L 并 resize。
+        返回 int（DHASH_SIZE^2 bits）。失败返回 None。
         """
-        if not os.path.exists(kml_file_path):
-            logger.error(f"KML文件不存在: {kml_file_path}")
-            return False
+        try:
+            sz = cls.DHASH_SIZE
+            gray = img.convert('L').resize((sz + 1, sz), Image.LANCZOS)
+            px = list(gray.getdata())
+            w = sz + 1
+            bits = 0
+            idx = 0
+            for y in range(sz):
+                row = y * w
+                for x in range(sz):
+                    if px[row + x] > px[row + x + 1]:
+                        bits |= 1 << idx
+                    idx += 1
+            return bits
+        except Exception:
+            return None
 
-        if output_dir is None:
-            output_dir = os.path.join(os.path.dirname(kml_file_path), 'tiff_output')
+    @classmethod
+    def compute_dhash_int_from_path(cls, path: str) -> Optional[int]:
+        try:
+            with Image.open(path) as im:
+                return cls.compute_dhash_int(im)
+        except Exception:
+            return None
 
-        kml_filename = os.path.splitext(os.path.basename(kml_file_path))[0]
-        kml_output_dir = os.path.join(output_dir, kml_filename)
+    @staticmethod
+    def _hamming(a: Optional[int], b: Optional[int]) -> int:
+        if a is None or b is None:
+            return (WaybackImageFetcher.DHASH_SIZE *
+                    WaybackImageFetcher.DHASH_SIZE)  # 最坏距离，永不判重
+        return bin(a ^ b).count('1')
 
-        png_output_dir = os.path.join(kml_output_dir, 'png')
-        tiff_output_dir = os.path.join(kml_output_dir, 'tif')
+    def _fetch_center_tile_dhash(self, lat: float, lon: float, zoom: int,
+                                 wayback_id: str, temp_root: str) -> Optional[int]:
+        """为指定坐标 + wayback 版本，预下载 1 张「覆盖中心点」的瓦片，返回其 dHash。
 
-        if download_mode in ['previous', 'both']:
-            png_previous_dir = os.path.join(kml_output_dir, 'png_previous')
-            tiff_previous_dir = os.path.join(kml_output_dir, 'tif_previous')
-            os.makedirs(png_previous_dir, exist_ok=True)
-            os.makedirs(tiff_previous_dir, exist_ok=True)
+        作为 1-tile / ~50KB 量级的预筛；比下完几 MB 整片再发现重复，
+        能节省 90%+ 的网络开销。失败返回 None，调用方应放弃预筛。
+        """
+        try:
+            x, y = self._center_tile(lat, lon, zoom)
+            tmp_dir = os.path.join(temp_root, f"probe_{wayback_id}")
+            os.makedirs(tmp_dir, exist_ok=True)
+            save_path = os.path.join(tmp_dir, f"{x}_{y}.png")
+            if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
+                pass  # 复用之前探针
+            else:
+                url = self._resolve_tile_url(wayback_id, zoom, y, x)
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                try:
+                    resp = self.session.get(url, headers=headers, timeout=30)
+                    if resp.status_code != 200 or len(resp.content) <= 1000:
+                        return None
+                    with open(save_path, 'wb') as f:
+                        f.write(resp.content)
+                except Exception:
+                    return None
+            with Image.open(save_path) as im:
+                return self.compute_dhash_int(im)
+        except Exception:
+            return None
 
-        os.makedirs(png_output_dir, exist_ok=True)
-        os.makedirs(tiff_output_dir, exist_ok=True)
+    @staticmethod
+    def _center_tile(lat: float, lon: float, zoom: int) -> Tuple[int, int]:
+        """返回覆盖 (lat, lon, zoom) 的瓦片坐标（int, int）。"""
+        lat_rad = math.radians(lat)
+        n = 2.0 ** zoom
+        x = int((lon + 180.0) / 360.0 * n)
+        y = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+        x = max(0, min(n - 1, x))
+        y = max(0, min(n - 1, y))
+        return x, y
 
-        logger.info(f"KML文件输出目录: {kml_output_dir}")
-        logger.info(f"PNG文件保存目录: {png_output_dir}")
-        logger.info(f"TIFF文件保存目录: {tiff_output_dir}")
-        if download_mode in ['previous', 'both']:
-            logger.info(f"历史PNG文件保存目录: {png_previous_dir}")
-            logger.info(f"历史TIFF文件保存目录: {tiff_previous_dir}")
+    def _is_duplicate_image(self, path_or_dhash, byte_hashes=None,
+                            dhashes=None, strict: bool = False):
+        """判定输入是否与历史记录重复。
 
-        buffers = self.parse_kml_file(kml_file_path)
-        if not buffers:
-            logger.error("未找到有效的缓冲区数据")
-            return False
-
-        current_date, previous_date = self.get_current_and_previous_dates(service_name)
-
-        if not buffers:
-            first_buffer = None
+        path_or_dhash: 图片路径(str) 或 预计算的 (md5, dhash) 二元组；
+        byte_hashes:   字节级 MD5 set；
+        dhashes:       感知 dhash int set；
+        strict:        False 使用 DHASH_DUP_THRESHOLD；True 更严格（仅 0/1）。
+        返回 (is_dup: bool, matched_md5, matched_dhash)。
+        """
+        if isinstance(path_or_dhash, tuple) and len(path_or_dhash) == 2:
+            img_md5, img_dhash = path_or_dhash
         else:
-            first_buffer = buffers[0]
-        
-        if first_buffer:
-            query_lat = first_buffer['center_lat']
-            query_lon = first_buffer['center_lon']
-            query_zoom = self.calculate_zoom_level(
-                first_buffer['min_lat'], first_buffer['max_lat'],
-                first_buffer['min_lon'], first_buffer['max_lon']
+            img_md5 = self.compute_image_hash(path_or_dhash)
+            img_dhash = self.compute_dhash_int_from_path(path_or_dhash)
+
+        # 1) 字节级 exact match → 直接确定重复
+        if img_md5 and byte_hashes is not None and img_md5 in byte_hashes:
+            return True, img_md5, img_dhash
+
+        # 2) 感知级近似 match → 视觉重复（ESRI 重发布的坑）
+        if img_dhash is not None and dhashes is not None:
+            thresh = 1 if strict else self.DHASH_DUP_THRESHOLD
+            for known in dhashes:
+                if self._hamming(img_dhash, known) <= thresh:
+                    return True, img_md5, img_dhash
+        return False, img_md5, img_dhash
+
+    # ------------------------------------------------------------------
+    # 单日期版本下载主流程
+    # ------------------------------------------------------------------
+    def download_image(self, lat: float, lon: float, zoom: int,
+                       date_info: Dict, output_dir: str,
+                       buffer_size: int = 500,
+                       probe_root: Optional[str] = None) -> Optional[Dict]:
+        """下载单日期版本影像。
+
+        probe_root: 若指定，先下载中心瓦片做 dHash 预筛；命中直接跳过，
+                    可节省 90%+ 重复发布的网络/CPU。为 None 则跳过预筛。
+
+        显式参数：lat / lon / zoom / buffer_size 会在此行同时打印，
+                  便于用户一眼核对「级别」与「缓冲距离」是否按预期传递。
+        """
+        date_str = date_info['date']
+        wayback_id = date_info['id']
+
+        x_min, x_max, y_min, y_max = self.get_tile_coords(lat, lon, zoom, buffer_size)
+        expected_tile_count = (x_max - x_min + 1) * (y_max - y_min + 1)
+        min_lon, min_lat, max_lon, max_lat = self._tile_bounds_wgs84(
+            x_min, x_max, y_min, y_max, zoom
+        )
+        cos_lat = max(math.cos(math.radians(lat)), 1e-6)
+        ew_m = (max_lon - min_lon) * 111320.0 * cos_lat
+        ns_m = (max_lat - min_lat) * 111320.0
+
+        logger.info(
+            f"下载 {date_str} (ID: {wayback_id}) "
+            f"[zoom={zoom}, buffer={buffer_size}m, "
+            f"瓦片 {x_max-x_min+1}×{y_max-y_min+1}={expected_tile_count}, "
+            f"地面覆盖 ~ {ew_m:.0f}m × {ns_m:.0f}m]"
+        )
+
+        # ---------- 0) 预筛：1 张中心瓦片 dHash 短路（避免整片区下载） ----------
+        if probe_root:
+            tile_dhash = self._fetch_center_tile_dhash(
+                lat, lon, zoom, wayback_id, probe_root,
             )
-            current_date, previous_date = self.get_current_and_previous_dates(service_name, query_lat, query_lon, query_zoom)
+            if tile_dhash is not None and self._probe_tile_dhashes:
+                for known in self._probe_tile_dhashes.values():
+                    if self._hamming(tile_dhash, known) <= self.DHASH_TILE_THRESHOLD:
+                        logger.info(
+                            f"[预筛-中心瓦片] {date_str} 与已收录版本视觉相同，"
+                            f"跳过 (dHash 距离 {self._hamming(tile_dhash, known)})"
+                        )
+                        self._probe_tile_dhashes.setdefault(wayback_id, tile_dhash)
+                        return {
+                            'status': 'duplicate',
+                            'date': date_str,
+                            'tile_dhash': tile_dhash,
+                            'reason': 'precheck-tile-dhash',
+                        }
+            if tile_dhash is not None:
+                self._probe_tile_dhashes.setdefault(wayback_id, tile_dhash)
 
-        if current_date and current_date.get('date'):
-            current_timestamp = current_date['date'].replace('-', '')
-            logger.info(f"当前影像时间戳: {current_timestamp}")
-            if current_date.get('url_template'):
-                logger.debug(f"当前影像URL模板: {current_date['url_template']}")
+        temp_dir = f"temp_tiles_{date_str.replace('-', '')}"
+        for _ in range(3):
+            try:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                break
+            except PermissionError:
+                time.sleep(0.5)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        tile_coords = [(x, y) for x in range(x_min, x_max + 1)
+                      for y in range(y_min, y_max + 1)]
+        downloaded = self.download_tiles_batch(tile_coords, zoom, temp_dir, wayback_id)
+
+        if downloaded == 0:
+            logger.error(f"瓦片下载失败: {date_str}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None
+
+        # 精确边界（基于瓦片四角）
+        min_lon, min_lat, max_lon, max_lat = self._tile_bounds_wgs84(
+            x_min, x_max, y_min, y_max, zoom
+        )
+        bounds = {
+            'min_lon': min_lon,
+            'max_lon': max_lon,
+            'min_lat': min_lat,
+            'max_lat': max_lat,
+        }
+
+        # 拼接（缺失瓦片会抛 IncompleteTilesError）
+        temp_png_path = os.path.join(temp_dir, f"{date_str}.png")
+        try:
+            ok, actual_count = self.stitch_tiles(
+                temp_dir, expected_tile_count, temp_png_path
+            )
+        except IncompleteTilesError as e:
+            logger.error(f"{date_str}: {e}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None
+
+        if not ok:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None
+
+        # ---------- 1) 整图 MD5 + 感知 dHash 双重去重 ----------
+        img_md5 = self.compute_image_hash(temp_png_path)
+        img_dhash = self.compute_dhash_int_from_path(temp_png_path)
+        is_dup, _, _ = self._is_duplicate_image(
+            (img_md5, img_dhash),
+            byte_hashes=self._downloaded_hashes,
+            dhashes=self._downloaded_dhashes,
+        )
+        if is_dup:
+            logger.info(f"[整图去重] {date_str} 与之前版本视觉相同，跳过")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return {
+                'status': 'duplicate',
+                'hash': img_md5,
+                'dhash': img_dhash,
+                'date': date_str,
+            }
+
+        # ---------- 2) 按用户 buffer 精确裁剪中心矩形（解决低 zoom 单瓦片过大的问题） ----------
+        clip_rect = self._buffer_wgs84_rect(lat, lon, buffer_size)
+        canvas_bounds = (min_lon, min_lat, max_lon, max_lat)
+        try:
+            new_bounds, px_box, did_crop = self._crop_png_to_wgs84_rect(
+                temp_png_path,
+                canvas_bounds,
+                clip_rect,
+            )
+        except ValueError as e:
+            logger.error(f"{date_str} 裁剪失败：{e}；回退为输出原始瓦片矩形")
+            new_bounds = bounds
+            did_crop = False
+            px_box = (0, 0, 0, 0)
+
+        # 裁剪后的实际输出范围（米），用于日志
+        out_ew_m = (new_bounds['max_lon'] - new_bounds['min_lon']) * 111320.0 * cos_lat
+        out_ns_m = (new_bounds['max_lat'] - new_bounds['min_lat']) * 111320.0
+        if did_crop:
+            logger.info(
+                f"[范围] 瓦片覆盖 {ew_m:.0f}×{ns_m:.0f}m → 裁剪后输出 "
+                f"{out_ew_m:.0f}×{out_ns_m:.0f}m (px box {px_box})"
+            )
         else:
-            # 使用固定的默认日期，不使用当前系统时间
-            current_timestamp = '20251231'
-            logger.info(f"当前影像时间戳: {current_timestamp} (使用默认日期)")
+            logger.info(
+                f"[范围] 瓦片覆盖 {ew_m:.0f}×{ns_m:.0f}m → 直接输出 "
+                f"{out_ew_m:.0f}×{out_ns_m:.0f}m"
+            )
+        bounds = new_bounds
 
-        if previous_date and previous_date.get('date'):
-            previous_timestamp = previous_date['date'].replace('-', '')
-            logger.info(f"历史影像时间戳: {previous_timestamp}")
-            if previous_date.get('url_template'):
-                logger.debug(f"历史影像URL模板: {previous_date['url_template']}")
-            # 验证历史影像和当前影像的URL是否不同
-            if current_date and current_date.get('url_template') and previous_date.get('url_template'):
-                if current_date['url_template'] != previous_date['url_template']:
-                    logger.info("[OK] 历史影像和当前影像使用不同的URL模板")
-                else:
-                    logger.error("[ERROR] 历史影像和当前影像使用相同的URL模板")
+        # 写入输出
+        date_dir = os.path.join(output_dir, date_str)
+        os.makedirs(date_dir, exist_ok=True)
+        png_path = os.path.join(date_dir, f"{date_str}.png")
+        tif_path = os.path.join(date_dir, f"{date_str}.tif")
+
+        if self.png_to_geotiff(temp_png_path, tif_path, bounds):
+            # GeoTIFF 成功，复制 PNG 到输出目录
+            with open(temp_png_path, 'rb') as src:
+                with open(png_path, 'wb') as dst:
+                    dst.write(src.read())
+            if img_md5:
+                self._downloaded_hashes.add(img_md5)
+            if img_dhash is not None:
+                self._downloaded_dhashes.add(img_dhash)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info(
+                f"成功: {tif_path} "
+                f"[最终覆盖 {out_ew_m:.0f}m(EW) × {out_ns_m:.0f}m(NS)]"
+            )
+            return {
+                'status': 'success',
+                'hash': img_md5,
+                'dhash': img_dhash,
+                'date': date_str,
+                'path': tif_path
+            }
         else:
-            # 使用固定的历史默认日期，不使用当前系统时间
-            previous_timestamp = '20241231'
-            logger.info(f"历史影像时间戳: {previous_timestamp} (使用默认历史日期)")
+            # GeoTIFF 失败（rasterio 不可用），降级为仅输出 PNG
+            logger.warning(f"GeoTIFF 转换失败，降级为仅输出 PNG: {date_str}")
+            with open(temp_png_path, 'rb') as src:
+                with open(png_path, 'wb') as dst:
+                    dst.write(src.read())
+            if img_md5:
+                self._downloaded_hashes.add(img_md5)
+            if img_dhash is not None:
+                self._downloaded_dhashes.add(img_dhash)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info(
+                f"成功（仅 PNG）: {png_path} "
+                f"[最终覆盖 {out_ew_m:.0f}m(EW) × {out_ns_m:.0f}m(NS)]"
+            )
+            return {
+                'status': 'success',
+                'hash': img_md5,
+                'dhash': img_dhash,
+                'date': date_str,
+                'path': png_path
+            }
 
-        success_count = 0
-        previous_success_count = 0
+    # ------------------------------------------------------------------
+    # 批量入口
+    # ------------------------------------------------------------------
+    def fetch_all_historical(self, lat: float, lon: float, zoom: int = 18,
+                             output_dir: str = 'data/output/historical',
+                             buffer_size: int = 500,
+                             date_range: Optional[Tuple[str, str]] = None) -> List[Dict]:
+        logger.info("=" * 60)
+        logger.info(f"获取坐标 ({lat:.6f}, {lon:.6f}) 的历史影像")
+        logger.info("=" * 60)
 
-        for i, buffer_info in enumerate(buffers):
-            logger.info(f"\n处理缓冲区 {i+1}/{len(buffers)}: {buffer_info.get('id', 'Unknown')}")
+        # 清空已下载哈希记录（双重：MD5 + dHash）
+        self._downloaded_hashes.clear()
+        self._downloaded_dhashes.clear()
+        self._probe_tile_dhashes.clear()
 
-            zoom = self.calculate_zoom_level(
-                buffer_info['min_lat'], buffer_info['max_lat'],
-                buffer_info['min_lon'], buffer_info['max_lon']
+        # 预筛临时目录：同一坐标点所有 release 共用（1 tile/release，非常小）
+        probe_root = os.path.join(
+            os.path.abspath(output_dir),
+            f"_probe_{zoom}_{lat:.5f}_{lon:.5f}".replace('-', 'm').replace('.', 'p'),
+        )
+        try:
+            os.makedirs(probe_root, exist_ok=True)
+        except Exception:
+            probe_root = None  # 建目录失败就放弃预筛，不影响主流程
+
+        # ---------- 预填充：扫描已有 PNG 同时建 MD5 + dHash 两条索引 ----------
+        if os.path.exists(output_dir):
+            for date_dir in sorted(os.listdir(output_dir)):
+                png_path = os.path.join(output_dir, date_dir, f'{date_dir}.png')
+                if not os.path.exists(png_path):
+                    continue
+                img_md5 = self.compute_image_hash(png_path)
+                img_dhash = self.compute_dhash_int_from_path(png_path)
+                if img_md5:
+                    self._downloaded_hashes.add(img_md5)
+                if img_dhash is not None:
+                    self._downloaded_dhashes.add(img_dhash)
+                logger.info(f"已存在: {date_dir}")
+
+        dates = self.get_available_dates(lat, lon, zoom)
+
+        if date_range:
+            dates = [d for d in dates if date_range[0] <= d['date'] <= date_range[1]]
+            logger.info(f"日期筛选后剩余 {len(dates)} 个")
+
+        results = []
+        skipped_duplicates = 0
+        skipped_existing = 0
+
+        for i, date_info in enumerate(dates, 1):
+            date_str = date_info['date']
+            logger.info(f"[{i}/{len(dates)}] {date_str}...")
+
+            date_dir = os.path.join(output_dir, date_str)
+            png_path = os.path.join(date_dir, f'{date_str}.png')
+            tif_path = os.path.join(date_dir, f'{date_str}.tif')
+
+            # ---------- 已有文件：去重 or 直接跳过 ----------
+            if os.path.exists(png_path):
+                is_dup, img_md5, img_dhash = self._is_duplicate_image(
+                    png_path,
+                    byte_hashes=self._downloaded_hashes,
+                    dhashes=self._downloaded_dhashes,
+                )
+                if is_dup:
+                    logger.info(f"[感知去重] {date_str} 与已保存版本视觉相同，标记重复")
+                    skipped_duplicates += 1
+                    results.append({
+                        'date': date_str,
+                        'name': date_info.get('name', date_str),
+                        'status': 'duplicate',
+                        'file_path': tif_path if os.path.exists(tif_path) else None,
+                    })
+                    continue
+                # 非重复：把当前文件的 hash 登记，避免新下的覆盖它
+                if img_md5:
+                    self._downloaded_hashes.add(img_md5)
+                if img_dhash is not None:
+                    self._downloaded_dhashes.add(img_dhash)
+                skipped_existing += 1
+                logger.info(f"已存在文件，跳过下载: {date_str}")
+                results.append({
+                    'date': date_str,
+                    'name': date_info.get('name', date_str),
+                    'status': 'existing',
+                    'file_path': tif_path if os.path.exists(tif_path) else None,
+                })
+                continue
+
+            # ---------- 新下载：启用中心瓦片预筛 ----------
+            result = self.download_image(
+                lat, lon, zoom, date_info, output_dir, buffer_size,
+                probe_root=probe_root,
             )
 
-            buffer_id = buffer_info.get('id', f'buffer_{i+1}')
+            if result is None:
+                results.append({
+                    'date': date_str,
+                    'name': date_info.get('name', date_str),
+                    'status': 'failed',
+                    'file_path': None,
+                })
+            elif result['status'] == 'duplicate':
+                skipped_duplicates += 1
+                results.append({
+                    'date': date_str,
+                    'name': date_info.get('name', date_str),
+                    'status': 'duplicate',
+                    'file_path': None,
+                })
+            else:
+                results.append({
+                    'date': date_str,
+                    'name': date_info.get('name', date_str),
+                    'status': 'success',
+                    'file_path': result['path'],
+                })
+            time.sleep(0.3)
 
-            if download_mode in ['current', 'both']:
-                png_filename = f"{current_timestamp}_{buffer_id}.png"
-                png_path = os.path.join(png_output_dir, png_filename)
-                tiff_filename = f"{current_timestamp}_{buffer_id}.tif"
-                tiff_path = os.path.join(tiff_output_dir, tiff_filename)
+        # 清理：预筛目录用完即销毁（其内容对用户无意义）
+        if probe_root and os.path.exists(probe_root):
+            shutil.rmtree(probe_root, ignore_errors=True)
 
-                logger.info(f"\n[当前影像] 下载缓冲区 {buffer_id} 的当前影像...")
-                logger.info(f"  保存路径: {png_path}")
-                logger.info(f"  使用影像信息: {current_date.get('name', 'Unknown')} (日期: {current_date.get('date', 'unknown')})")
-                
-                if self.download_satellite_image(
-                    buffer_info['center_lat'], buffer_info['center_lon'],
-                    zoom, png_path, tile_count=3, kml_bounds=buffer_info,
-                    image_type='current', image_date_info=current_date,
-                    service_name=service_name
-                ):
-                    if self.png_to_geotiff(png_path, tiff_path, buffer_info):
-                        success_count += 1
-                        logger.info(f"[当前影像] 成功生成: {tiff_path}")
-                    else:
-                        logger.error(f"[当前影像] TIFF转换失败")
-                else:
-                    logger.error(f"[当前影像] 影像下载失败")
+        success = sum(1 for r in results if r['status'] == 'success')
+        failed = sum(1 for r in results if r['status'] == 'failed')
 
-                time.sleep(1)
+        logger.info(f"\n完成！成功 {success}/{len(results)} 个")
+        if skipped_existing > 0:
+            logger.info(f"跳过已有文件: {skipped_existing} 个")
+        if skipped_duplicates > 0:
+            logger.info(f"跳过重复图片: {skipped_duplicates} 个")
+        if failed > 0:
+            logger.info(f"下载失败: {failed} 个")
 
-            if download_mode in ['previous', 'both'] and previous_date is not None:
-                png_filename = f"{previous_timestamp}_{buffer_id}.png"
-                png_path = os.path.join(png_previous_dir, png_filename)
-                tiff_filename = f"{previous_timestamp}_{buffer_id}.tif"
-                tiff_path = os.path.join(tiff_previous_dir, tiff_filename)
+        return results
 
-                logger.info(f"\n[历史影像] 下载缓冲区 {buffer_id} 的历史影像...")
-                logger.info(f"  保存路径: {png_path}")
-                logger.info(f"  使用影像信息: {previous_date.get('name', 'Unknown')} (日期: {previous_date.get('date', 'unknown')})")
-                
-                if self.download_satellite_image(
-                    buffer_info['center_lat'], buffer_info['center_lon'],
-                    zoom, png_path, tile_count=3, kml_bounds=buffer_info,
-                    image_type='previous', image_date_info=previous_date,
-                    service_name=service_name
-                ):
-                    if self.png_to_geotiff(png_path, tiff_path, buffer_info):
-                        previous_success_count += 1
-                        logger.info(f"[历史影像] 成功生成: {tiff_path}")
-                    else:
-                        logger.error(f"[历史影像] TIFF转换失败")
-                else:
-                    logger.error(f"[历史影像] 影像下载失败")
+    # ------------------------------------------------------------------
+    # 批量入口（多坐标）
+    # ------------------------------------------------------------------
+    def fetch_batch_historical(self, coords: List[Dict],
+                               output_root: str,
+                               zoom: int = 18,
+                               buffer_size: int = 500,
+                               date_range: Optional[Tuple[str, str]] = None,
+                               coord_concurrency: int = 1) -> List[Dict]:
+        """批量获取多坐标点的历史影像。
 
-                time.sleep(1)
-            elif download_mode in ['previous', 'both'] and previous_date is None:
-                logger.warning(f"\n[历史影像] 跳过缓冲区 {buffer_id} 的历史影像下载：未找到可用的历史影像日期")
+        Args:
+            coords: 由 coordinate_loader.load_coordinates_file 返回的坐标列表，
+                    每项必须含 lat, lon；name, id 可选。
+            output_root: 批量输出根目录；每个坐标点一个独立子目录。
+            zoom, buffer_size, date_range: 同 fetch_all_historical。
+            coord_concurrency: 坐标级别并发数；默认 1（串行，避免 ESRI 限流）。
 
-        logger.info(f"\n处理完成:")
-        if download_mode in ['current', 'both']:
-            logger.info(f"  当前影像: {success_count}/{len(buffers)} 个缓冲区成功生成TIFF图像")
-        if download_mode in ['previous', 'both']:
-            logger.info(f"  历史影像: {previous_success_count}/{len(buffers)} 个缓冲区成功生成TIFF图像")
+        Returns:
+            每个坐标点的 (name, lat, lon, results, output_dir) 元信息列表。
+        """
+        if not coords:
+            logger.warning("批量坐标列表为空")
+            return []
 
-        return success_count > 0 or previous_success_count > 0
+        os.makedirs(output_root, exist_ok=True)
+
+        # 入参校验（顶层），单个坐标抛错不影响其他坐标
+        summary = []
+        total = len(coords)
+
+        for i, coord in enumerate(coords, start=1):
+            lat = float(coord['lat'])
+            lon = float(coord['lon'])
+            raw_id = coord.get('id') or ''
+            raw_name = coord.get('name') or ''
+            sub = raw_id or raw_name or f"point_{i}_{lat:.6f}_{lon:.6f}"
+            # 子目录名清洗（Windows 合法）
+            sub = re.sub(r'[\\/:\*\?"<>\|\x00-\x1f]', '_', str(sub))
+            sub = sub.replace(' ', '_').strip('._') or f"point_{i}"
+            if len(sub) > 64:
+                sub = sub[:64].rstrip('._')
+
+            coord_out = os.path.join(output_root, sub)
+            os.makedirs(coord_out, exist_ok=True)
+
+            logger.info("=" * 60)
+            logger.info(f"[{i}/{total}] 坐标点 {sub} ({lat:.6f}, {lon:.6f})")
+            logger.info("=" * 60)
+
+            try:
+                results = self.fetch_all_historical(
+                    lat=lat,
+                    lon=lon,
+                    zoom=zoom,
+                    output_dir=coord_out,
+                    buffer_size=buffer_size,
+                    date_range=date_range,
+                )
+            except ValueError as e:
+                logger.error(f"[{i}/{total}] {sub} 坐标越界: {e}")
+                results = []
+
+            success_n = sum(1 for r in results if r['status'] == 'success')
+            failed_n = sum(1 for r in results if r['status'] == 'failed')
+            summary.append({
+                'index': i,
+                'name': sub,
+                'lat': lat,
+                'lon': lon,
+                'output_dir': coord_out,
+                'total_dates': len(results),
+                'success': success_n,
+                'failed': failed_n,
+                'results': results,
+            })
+
+        total_success = sum(s['success'] for s in summary)
+        total_failed = sum(s['failed'] for s in summary)
+        logger.info("=" * 60)
+        logger.info(f"批量完成！共 {total} 个坐标点")
+        logger.info(f"  成功日期版本: {total_success}")
+        logger.info(f"  失败日期版本: {total_failed}")
+        logger.info("=" * 60)
+        return summary
+
+    # ------------------------------------------------------------------
+    # 启动时清理残余临时瓦片
+    # ------------------------------------------------------------------
+    def _cleanup_residual_temp_tiles(self, root_dir: Optional[str] = None):
+        """清理根目录下所有 temp_tiles_* 残留目录。供 __init__ 自动调用。
+
+        Args:
+            root_dir: 扫描根目录；默认 BASE_DIR。
+        Returns:
+            被清理的目录路径列表。
+        """
+        if root_dir is None:
+            try:
+                root_dir = os.path.dirname(os.path.abspath(__file__))
+            except Exception:
+                root_dir = os.getcwd()
+
+        removed = []
+        try:
+            entries = os.listdir(root_dir)
+        except OSError:
+            return removed
+
+        for entry in entries:
+            full = os.path.join(root_dir, entry)
+            if not (os.path.isdir(full) and entry.startswith('temp_tiles_')):
+                continue
+            try:
+                shutil.rmtree(full, ignore_errors=True)
+                removed.append(full)
+            except Exception:
+                pass
+        if removed:
+            logger.info(f"启动清理临时瓦片: {len(removed)} 个目录")
+        return removed
