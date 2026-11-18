@@ -3,10 +3,14 @@
 import os
 import struct
 import zlib
+import logging
 import requests
 import threading
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 PACKET_MAGIC = 0x7468dead
@@ -119,6 +123,91 @@ def quadtree_path_to_xyz(path: str) -> Tuple[int, int, int]:
     y = num_tiles - 1 - row
     x = col
     return x, y, z
+
+
+def lat_lon_to_quadtree_path(lat: float, lon: float, level: int) -> str:
+    """经纬度转 Google Earth Keyhole 四叉树路径。
+
+    Google Earth 使用等距圆柱网格，行从南向北递增，与 Web Mercator
+    的 XYZ 行方向不同，不能复用 :func:`xyz_to_quadtree_path`。
+    """
+    if not (-90.0 <= lat <= 90.0):
+        raise ValueError(f"lat 越界 {lat}，必须 ∈ [-90, 90]")
+    if not (-180.0 <= lon <= 180.0):
+        raise ValueError(f"lon 越界 {lon}，必须 ∈ [-180, 180]")
+    if not isinstance(level, int) or level < 0:
+        raise ValueError(f"level 非法 {level!r}")
+
+    n = 1 << level
+    # Google Earth 的经纬度都映射到 360° 范围：row = col = (deg + 180) / 360。
+    # 有效纬度只占中间的 -90..90，行范围约为 0.25n..0.75n。
+    col = int((lon + 180.0) / 360.0 * n)
+    row = int((lat + 180.0) / 360.0 * n)
+    col = max(0, min(n - 1, col))
+    row = max(0, min(n - 1, row))
+
+    path = ['0']
+    for i in range(level - 1, -1, -1):
+        row_bit = (row >> i) & 1
+        col_bit = (col >> i) & 1
+        path.append(str((row_bit << 1) | (row_bit ^ col_bit)))
+    return ''.join(path)
+
+
+def row_col_to_quadtree_path(row: int, col: int, level: int) -> str:
+    """等距圆柱网格行列转四叉树路径。"""
+    if not isinstance(level, int) or level < 0:
+        raise ValueError(f"level 非法 {level!r}")
+    n = 1 << level
+    if not (0 <= row < n and 0 <= col < n):
+        raise ValueError(f"行列越界 row={row} col={col} level={level}")
+
+    path = ['0']
+    for i in range(level - 1, -1, -1):
+        row_bit = (row >> i) & 1
+        col_bit = (col >> i) & 1
+        path.append(str((row_bit << 1) | (row_bit ^ col_bit)))
+    return ''.join(path)
+
+
+def quadtree_path_to_row_col(path: str) -> Tuple[int, int, int]:
+    """四叉树路径转等距圆柱网格的行、列与层级。"""
+    if not path or path[0] != '0':
+        raise ValueError(f"非法四叉树路径: {path!r}")
+    level = len(path) - 1
+    row = 0
+    col = 0
+    for ch in path[1:]:
+        quad = int(ch)
+        row_bit = (quad >> 1) & 1
+        col_bit = row_bit ^ (quad & 1)
+        row = (row << 1) | row_bit
+        col = (col << 1) | col_bit
+    return row, col, level
+
+
+def quadtree_path_bounds(path: str) -> Tuple[float, float, float, float]:
+    """返回路径对应的 WGS84 边界 (min_lat, min_lon, max_lat, max_lon)。"""
+    row, col, level = quadtree_path_to_row_col(path)
+    n = 1 << level
+    # 与 lat_lon_to_quadtree_path 保持一致，经纬度都使用 360° 范围。
+    min_lat = row / n * 360.0 - 180.0
+    max_lat = (row + 1) / n * 360.0 - 180.0
+    min_lon = col / n * 360.0 - 180.0
+    max_lon = (col + 1) / n * 360.0 - 180.0
+    return min_lat, min_lon, max_lat, max_lon
+
+
+def _node_index(path: str, level: int, base_level: int) -> int:
+    """计算目标层级节点在 4 层数据包中的索引。"""
+    relative = level - base_level
+    offsets = {0: 0, 1: 1, 2: 5, 3: 21, 4: 85}
+    if relative not in offsets:
+        raise ValueError(f"层级差非法: {relative}")
+    index = 0
+    for ch in path[base_level + 1:level + 1]:
+        index = index * 4 + int(ch)
+    return offsets[relative] + index
 
 
 def xor_decrypt(key: bytes, data: bytes) -> bytes:
@@ -278,6 +367,7 @@ class QuadtreeNode:
     """四叉树节点"""
 
     def __init__(self):
+        self.index = 0
         self.flags = 0
         self.cache_node_epoch = 0
         self.layers = []
@@ -314,63 +404,60 @@ class DatedTile:
         self.hex_date = ''
 
 
-def parse_quadtree_packet(data: bytes) -> Tuple[int, List[QuadtreeNode]]:
-    """解析四叉树数据包
-    
-    Args:
-        data: 解密解压后的protobuf数据
-    
-    Returns:
-        (packet_epoch, nodes) 元组
+def parse_quadtree_packet(data: bytes) -> Tuple[int, Dict[int, QuadtreeNode]]:
+    """解析四叉树数据包。
+
+    ``sparse_quadtree_node`` 是 proto2 group（wire type 3），不是普通的
+    length-delimited 字段。节点按 ``index`` 稀疏分布，需要用索引定位。
     """
     parser = ProtobufParser(data)
     packet_epoch = 0
-    nodes = []
-    
+    nodes: Dict[int, QuadtreeNode] = {}
+
     while parser.has_more():
         field_num, wire_type = parser.read_tag()
-        
+
         if field_num == 1 and wire_type == 0:
             packet_epoch = parser.read_varint()
+        elif field_num == 2 and wire_type == 3:
+            group = parser.read_group(field_num)
+            parsed = _parse_sparse_node(group)
+            if parsed is not None:
+                index, node = parsed
+                node.index = index
+                nodes[index] = node
         elif field_num == 2 and wire_type == 2:
             node_data = parser.read_bytes()
-            node = _parse_sparse_node(node_data)
-            if node:
-                nodes.append(node)
+            parsed = _parse_sparse_node(node_data)
+            if parsed is not None:
+                index, node = parsed
+                node.index = index
+                nodes[index] = node
         else:
             parser.skip_field(wire_type)
-    
+
     return packet_epoch, nodes
 
 
-def _parse_sparse_node(data: bytes) -> Optional[QuadtreeNode]:
-    """解析稀疏四叉树节点
-    
-    Args:
-        data: 节点数据
-    
-    Returns:
-        QuadtreeNode 或 None
-    """
+def _parse_sparse_node(data: bytes) -> Optional[Tuple[int, QuadtreeNode]]:
+    """解析稀疏四叉树节点，返回 ``(index, node)``。"""
     parser = ProtobufParser(data)
-    node = QuadtreeNode()
     index = 0
     node_data = None
-    
+
     while parser.has_more():
         field_num, wire_type = parser.read_tag()
-        
+
         if field_num == 3 and wire_type == 0:
             index = parser.read_varint()
         elif field_num == 4 and wire_type == 2:
             node_data = parser.read_bytes()
         else:
             parser.skip_field(wire_type)
-    
+
     if node_data:
-        node = _parse_node(node_data)
-        return node
-    
+        return index, _parse_node(node_data)
+
     return None
 
 
@@ -506,6 +593,8 @@ class GoogleEarthClient:
         self._db_version = 0
         self._initialized = False
         self._lock = threading.Lock()
+        self._dates_cache: Dict[str, List[Dict]] = {}
+        self._fallback_cache: Dict[Tuple[str, str], Dict] = {}
     
     def initialize(self) -> bool:
         """初始化Google Earth客户端，获取加密密钥和数据库版本
@@ -639,70 +728,95 @@ class GoogleEarthClient:
         except Exception:
             return 1031
     
-    def get_available_dates(self, x: int, y: int, z: int) -> List[Dict]:
-        """获取指定瓦片位置可用的历史影像日期列表
-        
-        Args:
-            x: 瓦片X坐标
-            y: 瓦片Y坐标
-            z: 缩放级别
-        
-        Returns:
-            可用日期字典列表，每个包含 date, year, month, day, epoch, hex_date
-        """
+    def get_dates_for_path(self, path: str) -> List[Dict]:
+        """查询指定四叉树路径的可用历史影像日期。"""
+        return self._query_dates_for_path(path)
+
+    def _query_dates_for_path(self, target_path: str) -> List[Dict]:
+        """从根数据包开始，按 cache_node_epoch 每 4 层下行查询日期。"""
+        cached = self._dates_cache.get(target_path)
+        if cached is not None:
+            return list(cached)
+
         if not self._initialized:
             if not self.initialize():
                 return []
-        
-        quadtree_path = xyz_to_quadtree_path(x, y, z)
-        return self._query_dates_for_path(quadtree_path)
-    
-    def _query_dates_for_path(self, target_path: str) -> List[Dict]:
-        """查询指定四叉树路径的可用历史影像日期
-        
-        Args:
-            target_path: 四叉树路径
-        
-        Returns:
-            可用日期字典列表
-        """
-        all_dates = {}
+
+        target_level = len(target_path) - 1
         epoch = self._db_version
-        
-        traversal_paths = get_traversal_paths(target_path)
-        
-        for path in traversal_paths:
-            packet_data = self._fetch_quadtree_packet(path, epoch)
+        base_level = 0
+        packet_path = '0'
+        result: List[Dict] = []
+
+        # 根包只包含 0-3 层（85 个节点），普通包包含 4 层（341 个节点）。
+        packet_data = self._fetch_quadtree_packet(packet_path, epoch)
+        if packet_data is None:
+            self._dates_cache[target_path] = result
+            return result
+
+        packet_epoch, nodes = parse_quadtree_packet(packet_data)
+        if target_level <= 3:
+            node = nodes.get(_node_index(target_path, target_level, 0))
+            if node is not None:
+                result = self._extract_dates(node, packet_epoch or epoch)
+            self._dates_cache[target_path] = result
+            return list(result)
+
+        branch = nodes.get(_node_index(target_path, 3, 0))
+        if branch is None or branch.cache_node_epoch == 0:
+            self._dates_cache[target_path] = result
+            return result
+
+        epoch = branch.cache_node_epoch
+        base_level = 3
+        packet_path = target_path[:4]
+
+        while target_level > base_level + 4:
+            packet_data = self._fetch_quadtree_packet(packet_path, epoch)
             if packet_data is None:
-                continue
-            
+                self._dates_cache[target_path] = result
+                return result
             packet_epoch, nodes = parse_quadtree_packet(packet_data)
-            
-            if not nodes:
+            branch = nodes.get(_node_index(target_path, base_level + 4, base_level))
+            if branch is None or branch.cache_node_epoch == 0:
+                self._dates_cache[target_path] = result
+                return result
+            epoch = branch.cache_node_epoch
+            base_level += 4
+            packet_path = target_path[:base_level + 1]
+
+        packet_data = self._fetch_quadtree_packet(packet_path, epoch)
+        if packet_data is not None:
+            packet_epoch, nodes = parse_quadtree_packet(packet_data)
+            node = nodes.get(_node_index(target_path, target_level, base_level))
+            if node is not None:
+                result = self._extract_dates(node, packet_epoch or epoch)
+
+        self._dates_cache[target_path] = result
+        return list(result)
+
+    @staticmethod
+    def _extract_dates(node: QuadtreeNode, packet_epoch: int) -> List[Dict]:
+        """从节点中提取历史影像日期，按日期升序返回。"""
+        dates: Dict[str, Dict] = {}
+        for layer in node.layers:
+            if layer.type != QuadtreeLayer.LAYER_TYPE_IMAGERY_HISTORY:
                 continue
-            
-            for node in nodes:
-                if node.cache_node_epoch != 0:
-                    epoch = node.cache_node_epoch
-                
-                for layer in node.layers:
-                    if layer.type == QuadtreeLayer.LAYER_TYPE_IMAGERY_HISTORY:
-                        for dt in layer.dated_tiles:
-                            date_key = f"{dt.year}-{dt.month:02d}-{dt.day:02d}"
-                            if date_key not in all_dates:
-                                all_dates[date_key] = {
-                                    'date': date_key,
-                                    'year': dt.year,
-                                    'month': dt.month,
-                                    'day': dt.day,
-                                    'epoch': dt.dated_tile_epoch if dt.dated_tile_epoch != 0 else layer.layer_epoch,
-                                    'hex_date': dt.hex_date,
-                                    'packed_date': dt.date
-                                }
-        
-        dates_list = list(all_dates.values())
-        dates_list.sort(key=lambda d: d['date'], reverse=True)
-        return dates_list
+            for dt in layer.dated_tiles:
+                if dt.date <= MIN_VALID_DATE:
+                    continue
+                date_key = f"{dt.year}-{dt.month:02d}-{dt.day:02d}"
+                epoch = dt.dated_tile_epoch or layer.layer_epoch or packet_epoch
+                dates[date_key] = {
+                    'date': date_key,
+                    'year': dt.year,
+                    'month': dt.month,
+                    'day': dt.day,
+                    'epoch': epoch,
+                    'hex_date': dt.hex_date,
+                    'packed_date': dt.date,
+                }
+        return [dates[key] for key in sorted(dates)]
     
     def _fetch_quadtree_packet(self, path: str, epoch: int) -> Optional[bytes]:
         """获取四叉树数据包
@@ -733,31 +847,66 @@ class GoogleEarthClient:
         except Exception:
             return None
     
-    def download_historical_tile(self, x: int, y: int, z: int,
-                                 hex_date: str, epoch: int,
-                                 save_path: str) -> bool:
-        """下载历史影像瓦片
-        
-        Args:
-            x: 瓦片X坐标
-            y: 瓦片Y坐标
-            z: 缩放级别
-            hex_date: 十六进制日期字符串
-            epoch: 瓦片版本号
-            save_path: 保存路径
-        
-        Returns:
-            是否下载成功
+    def download_tile_for_date(self, path: str, date_str: Optional[str],
+                               save_path: str) -> bool:
+        """按日期下载指定四叉树路径的瓦片。
+
+        ``date_str`` 为空或 ``current`` 时使用该路径最新可用日期。
+        请求日期不存在时回退到不晚于该日期的最近一版。
         """
+        dates = self._query_dates_for_path(path)
+        if not dates:
+            return False
+
+        requested = date_str or 'current'
+        cache_key = (path, requested)
+        cached = self._fallback_cache.get(cache_key)
+        if cached is not None:
+            if self.download_tile_for_path(
+                path, cached['hex_date'], cached['epoch'], save_path
+            ):
+                return True
+            self._fallback_cache.pop(cache_key, None)
+
+        if not date_str or date_str == 'current':
+            candidates = list(reversed(dates))
+        else:
+            exact = [item for item in dates if item['date'] == date_str]
+            older = sorted(
+                (item for item in dates if item['date'] < date_str),
+                key=lambda item: item['date'],
+                reverse=True,
+            )
+            newer = sorted(
+                (item for item in dates if item['date'] > date_str),
+                key=lambda item: item['date'],
+            )
+            candidates = exact + older + newer
+
+        for match in candidates[:5]:
+            if self.download_tile_for_path(
+                path, match['hex_date'], match['epoch'], save_path
+            ):
+                self._fallback_cache[cache_key] = match
+                if match['date'] != requested and requested != 'current':
+                    logger.debug(
+                        f"Google Earth 日期回退 {requested} -> {match['date']} ({path})"
+                    )
+                return True
+
+        return False
+
+    def download_tile_for_path(self, path: str, hex_date: str, epoch: int,
+                               save_path: str) -> bool:
+        """下载指定四叉树路径、日期与 epoch 的瓦片。"""
         if not self._initialized:
             if not self.initialize():
                 return False
-        
-        quadtree_path = xyz_to_quadtree_path(x, y, z)
-        
-        url = f"{TM_BASE_URL}&f1-{quadtree_path}-i.{epoch}-{hex_date}"
-        
-        return self._download_tile_with_fallback(url, save_path, quadtree_path, hex_date, epoch)
+
+        url = f"{TM_BASE_URL}&f1-{path}-i.{epoch}-{hex_date}"
+        return self._download_tile_with_fallback(
+            url, save_path, path, hex_date, epoch
+        )
     
     def _download_tile_with_fallback(self, primary_url: str, save_path: str,
                                       quadtree_path: str, hex_date: str,
@@ -837,69 +986,6 @@ class GoogleEarthClient:
         
         return False
     
-    def download_current_tile(self, x: int, y: int, z: int,
-                              save_path: str) -> bool:
-        """下载当前影像瓦片
-        
-        Args:
-            x: 瓦片X坐标
-            y: 瓦片Y坐标
-            z: 缩放级别
-            save_path: 保存路径
-        
-        Returns:
-            是否下载成功
-        """
-        quadtree_path = xyz_to_quadtree_path(x, y, z)
-        epoch = self._db_version if self._initialized else 1031
-        
-        url = f"{DEFAULT_BASE_URL}/f1-{quadtree_path}-i.{epoch}"
-        
-        try:
-            resp = self.session.get(url, timeout=self.timeout)
-            
-            if resp.status_code == 200:
-                content = resp.content
-                
-                if self._encryption_key:
-                    try:
-                        decrypted = xor_decrypt(self._encryption_key, content)
-                        if self._is_valid_image(decrypted):
-                            with open(save_path, 'wb') as f:
-                                f.write(decrypted)
-                            return True
-                    except Exception:
-                        pass
-                
-                if self._is_valid_image(content):
-                    with open(save_path, 'wb') as f:
-                        f.write(content)
-                    return True
-            
-            return False
-        except Exception:
-            return False
-    
-    def get_dates_for_area(self, center_x: int, center_y: int, z: int) -> List[Dict]:
-        """获取指定区域中心瓦片的可用历史影像日期
-        
-        Args:
-            center_x: 中心瓦片X坐标
-            center_y: 中心瓦片Y坐标
-            z: 缩放级别
-        
-        Returns:
-            可用日期字典列表
-        """
-        dates = self.get_available_dates(center_x, center_y, z)
-        
-        if not dates:
-            print("未找到历史影像日期，尝试使用较低缩放级别...")
-            if z > 5:
-                low_z = min(z - 3, 8)
-                scale = 1 << (z - low_z)
-                low_x = center_x // scale
-                low_y = center_y // scale
-                dates = self.get_available_dates(low_x, low_y, low_z)
-        
-        return dates
+    def download_latest_tile(self, path: str, save_path: str) -> bool:
+        """下载指定路径最新可用日期的瓦片，用作当前影像。"""
+        return self.download_tile_for_date(path, None, save_path)
