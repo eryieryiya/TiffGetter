@@ -315,6 +315,14 @@ conda activate satellite-image-processing
 pip install requests pillow numpy rasterio psutil pyshp pyproj ttkbootstrap tkintermapview
 ```
 
+## 测试
+
+测试套件全部离线运行，不访问网络、不读写 `data/output`：
+
+```bash
+python -m pytest
+```
+
 ## 打包为独立 exe
 
 将项目打包为独立的 Windows 可执行文件，无需安装 Python 环境即可运行。
