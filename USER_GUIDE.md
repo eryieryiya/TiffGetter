@@ -440,6 +440,21 @@ TiffGetter.exe --help
 | `--coord-concurrency N` | 批量模式并发数 1-16（默认 1） |
 | `--no-dedup` | 关闭重复检测，每个历史日期都单独输出（默认去重） |
 
+### Docker 运行（仅 CLI）
+
+镜像只包含命令行模式，不含 GUI：
+
+```bash
+docker pull ghcr.io/eryieryiya/tiffgetter:latest
+
+docker run --rm \
+  -v "$PWD/out:/app/data/output" \
+  ghcr.io/eryieryiya/tiffgetter:latest \
+  --source esri --lat 35.6586 --lon 139.7454
+```
+
+输出位于挂载目录下的 `<source>/current/` 或历史日期目录。Linux 下如遇写权限问题，加 `-u "$(id -u):$(id -g)"`；完整说明见 README 的「Docker（仅 CLI）」一节。
+
 ---
 
 ## 10. 输出文件结构

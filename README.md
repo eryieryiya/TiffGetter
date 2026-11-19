@@ -138,6 +138,31 @@ New York,liberty,40.6892,-74.0445
 - CRS：自动读取 `.prj`；非 EPSG:4326 时使用 `pyproj` 转换
 - 名称字段：优先 `name` / `id` / `name` / `name_zh` / 名称；否则取第一个字符串型字段
 
+### Docker（仅 CLI）
+
+镜像只包含命令行模式，不含 GUI。镜像地址：`ghcr.io/eryieryiya/tiffgetter`；`:latest` 随最新 tag 更新，生产环境建议固定 `:vX.Y.Z`。
+
+```bash
+# 单点：输出到宿主机 ./out
+docker run --rm \
+  -v "$PWD/out:/app/data/output" \
+  ghcr.io/eryieryiya/tiffgetter:v0.1.0 \
+  --source esri --lat 35.6586 --lon 139.7454 --zoom 15 --buffer 300
+
+# 批量：挂载坐标文件
+docker run --rm \
+  -v "$PWD/out:/app/data/output" \
+  -v "$PWD/points.csv:/app/points.csv:ro" \
+  ghcr.io/eryieryiya/tiffgetter:latest \
+  --coords-file /app/points.csv --source bing
+```
+
+- 容器内输出根目录为 `/app/data/output`，对应上面的宿主机挂载目录；默认仍按数据源生成 `<source>/current/` 或历史日期目录。
+- Linux 下若宿主机目录不可写，可加 `-u "$(id -u):$(id -g)"`，或提前给挂载目录写权限。
+- PowerShell 中把 `"$PWD/out:..."` 写成 `"${PWD}/out:/app/data/output"`。
+- 镜像不含 GUI；OSM 对数据中心 IP 可能限流，容器内建议优先使用 `esri`、`bing` 或 `wayback`。
+- GHCR 首次发布后包默认私有，需要在 GitHub 的 Packages 设置中把可见性改为 Public（如需公开）。
+
 ### GUI
 
 ```bash

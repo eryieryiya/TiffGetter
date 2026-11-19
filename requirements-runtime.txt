@@ -1,0 +1,9 @@
+# CLI 容器运行时依赖（精确锁定，供 Dockerfile 使用）
+# GUI / 测试依赖不在此列：ttkbootstrap、tkintermapview、tkcalendar、pytest、ruff
+requests==2.32.3
+Pillow==12.2.0
+numpy==2.2.6
+rasterio==1.4.3
+pyshp==3.1.6
+pyproj==3.7.2
+urllib3==2.2.3
