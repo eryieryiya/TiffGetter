@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
               '其它 → data/output/<source>）'),
     )
     parser.add_argument('--buffer', type=int, default=500,
-                        help='缓冲区大小，米 (默认: 500)')
+                        help='缓冲区半径，米 (默认: 500)')
     parser.add_argument('--date-range', nargs=2, metavar=('START', 'END'),
                         help='日期范围，如: 2020-01-01 2024-12-31（仅支持历史的数据源可用）')
     parser.add_argument('--coord-concurrency', type=int, default=1,
@@ -153,7 +153,7 @@ def main():
         print(f"坐标: ({args.lat}, {args.lon})")
     print(f"缩放级别: {args.zoom}")
     print(f"输出目录: {output_dir}")
-    print(f"缓冲区: {args.buffer} 米")
+    print(f"缓冲区半径: {args.buffer} 米")
     if date_range:
         print(f"日期范围: {date_range[0]} ~ {date_range[1]}")
     print("=" * 60)

@@ -435,9 +435,9 @@ TiffGetter.exe --help
 | `--source` | 数据源：`wayback`（默认）/ `esri` / `google` / `bing` / `osm` |
 | `--zoom` | 缩放级别 1-20（默认 18，按数据源上限截断） |
 | `--output` | 输出目录（默认 wayback → `data/output/historical`，其它 → `data/output/<source>`；显式指定后不再追加层级） |
-| `--buffer` | 缓冲区大小（米，50-5000，默认 500） |
+| `--buffer` | 缓冲区半径（米，50-5000，默认 500；中心到边缘） |
 | `--date-range START END` | 日期范围筛选，如 `2020-01-01 2024-12-31`（非历史源不可用，退出码 2） |
-| `--coord-concurrency N` | 批量模式并发数 1-16（默认 1） |
+| `--coord-concurrency N` | 批量模式坐标并发数 1-16（默认 1，实际并行处理） |
 | `--no-dedup` | 关闭重复检测，每个历史日期都单独输出（默认去重） |
 
 ### Docker 运行（仅 CLI）

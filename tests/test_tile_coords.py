@@ -231,10 +231,10 @@ def test_buffer_rect_is_symmetric_around_center(fetcher):
     assert lat - clip_min_lat == pytest.approx(half_lat)
 
     # 与按米换算的期望值一致（经度按 cos(lat) 修正）
-    expected_half_lon = (buffer_size / 2.0) / (
+    expected_half_lon = buffer_size / (
         111320.0 * math.cos(math.radians(lat))
     )
-    expected_half_lat = (buffer_size / 2.0) / 111320.0
+    expected_half_lat = buffer_size / 111320.0
     assert half_lon == pytest.approx(expected_half_lon)
     assert half_lat == pytest.approx(expected_half_lat)
 

@@ -103,6 +103,7 @@ class App(ThemeMixin, RunnerMixin, MapPickerMixin,
         root.title("TiffGetter 卫星影像获取")
         root.geometry("960x720")
         root.minsize(820, 600)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
         self.poll_log_queue()

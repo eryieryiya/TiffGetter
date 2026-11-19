@@ -845,11 +845,23 @@ class ImageFetcher:
 
         os.makedirs(output_root, exist_ok=True)
 
-        # 入参校验（顶层），单个坐标抛错不影响其他坐标
+        # 实际生效的去重开关：显式入参优先，否则沿用实例配置
+        effective_dedup = self.dedup if dedup is None else dedup
+
         summary = []
         total = len(coords)
 
-        for i, coord in enumerate(coords, start=1):
+        def _process(index: int, coord: Dict) -> Dict:
+            """处理单个坐标点（可在线程池中并发执行），返回该坐标的汇总信息。
+
+            Args:
+                index: 1 起始的坐标序号，用于日志与 summary。
+                coord: 含 lat/lon（必需）及 id/name（可选）的坐标字典。
+            Returns:
+                含 index/name/lat/lon/output_dir/total_dates/success/failed/results
+                的汇总字典。
+            """
+            i = index
             lat = float(coord['lat'])
             lon = float(coord['lon'])
             raw_id = coord.get('id') or ''
@@ -868,15 +880,21 @@ class ImageFetcher:
             logger.info(f"[{i}/{total}] 坐标点 {sub} ({lat:.6f}, {lon:.6f})")
             logger.info("=" * 60)
 
+            # 并发时每个坐标使用独立实例，隔离 requests.Session 与去重状态
+            if coord_concurrency <= 1:
+                worker = self
+            else:
+                worker = ImageFetcher(source=self.info.name, dedup=effective_dedup)
+
             try:
-                results = self.fetch_all(
+                results = worker.fetch_all(
                     lat=lat,
                     lon=lon,
                     zoom=zoom,
                     output_dir=coord_out,
                     buffer_size=buffer_size,
                     date_range=date_range,
-                    dedup=dedup,
+                    dedup=effective_dedup,
                 )
             except ValueError as e:
                 logger.error(f"[{i}/{total}] {sub} 坐标越界: {e}")
@@ -884,7 +902,7 @@ class ImageFetcher:
 
             success_n = sum(1 for r in results if r['status'] == 'success')
             failed_n = sum(1 for r in results if r['status'] == 'failed')
-            summary.append({
+            return {
                 'index': i,
                 'name': sub,
                 'lat': lat,
@@ -894,7 +912,23 @@ class ImageFetcher:
                 'success': success_n,
                 'failed': failed_n,
                 'results': results,
-            })
+            }
+
+        if coord_concurrency <= 1:
+            # 串行：按输入顺序逐个处理
+            for i, coord in enumerate(coords, start=1):
+                summary.append(_process(i, coord))
+        else:
+            # 并发：按输入顺序提交，按提交顺序收集，保证 summary 与输入同序
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=coord_concurrency
+            ) as executor:
+                futures = [
+                    executor.submit(_process, i, coord)
+                    for i, coord in enumerate(coords, start=1)
+                ]
+                for future in futures:
+                    summary.append(future.result())
 
         total_success = sum(s['success'] for s in summary)
         total_failed = sum(s['failed'] for s in summary)

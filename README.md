@@ -10,7 +10,7 @@
 - 批量下载：CSV / SHP 文件批量坐标，Point 直接取点、Polygon 自动取 centroid
 - 多数据源可选，默认 **ESRI Wayback**（历史影像）
 - 支持日期范围筛选（仅支持历史版本的数据源）
-- 可调节缩放级别（1-20）和缓冲区大小
+- 可调节缩放级别（1-20）和缓冲区半径
 - 多线程并发下载，自动 MD5 + dHash 去重（按数据源隔离），可用 `--no-dedup` 关闭
 - 输出 GeoTIFF（带地理参考）和 PNG 预览
 - 每个输出目录写入 `metadata.json`（数据源、版本、版权、范围、参数）
@@ -146,7 +146,7 @@ New York,liberty,40.6892,-74.0445
 # 单点：输出到宿主机 ./out
 docker run --rm \
   -v "$PWD/out:/app/data/output" \
-  ghcr.io/eryieryiya/tiffgetter:v0.1.0 \
+  ghcr.io/eryieryiya/tiffgetter:v0.1.1 \
   --source esri --lat 35.6586 --lon 139.7454 --zoom 15 --buffer 300
 
 # 批量：挂载坐标文件
@@ -184,7 +184,7 @@ python ui_main.py
 | 数据源 | wayback / esri / google / bing / osm | 默认 ESRI Wayback；子进程显式传递 `--source` |
 | 坐标 | 纬度、经度 | 目标点坐标（单点 Tab） |
 | 参数设置 | 缩放级别 (1-20，随数据源) | 地图瓦片缩放级别，非历史源上限较低 |
-| | 缓冲区（米，50-5000） | 下载范围半径 |
+| | 缓冲区（米，50-5000） | 中心到边缘的半径 |
 | 日期范围 | 起始 / 截止（可选） | 仅支持历史版本的数据源可用 |
 | 输出设置 | 输出目录 | 下载文件保存路径，默认随数据源变化 |
 | 批量文件 | CSV / SHP 文件 | 批量下载 Tab |
@@ -210,10 +210,10 @@ python ui_main.py
 |------|------|--------|
 | `--source` | 数据源：`wayback` / `esri` / `google` / `bing` / `osm` | `wayback` |
 | `--zoom` | 缩放级别 (1-20，按数据源上限截断) | 18 |
-| `--buffer` | 缓冲区大小（米） | 500 |
+| `--buffer` | 缓冲区半径（米，中心到边缘） | 500 |
 | `--output` | 输出目录 | wayback → `data/output/historical`；其它 → `data/output/<source>` |
 | `--date-range` | 日期范围筛选（起始 截止，仅支持历史的数据源） | 全部 |
-| `--coord-concurrency` | 批量模式下坐标并发数 (1-16) | 1 |
+| `--coord-concurrency` | 批量模式下坐标并发数 (1-16，实际并行处理) | 1 |
 | `--no-dedup` | 关闭重复检测，每个历史日期都单独输出 | 关闭（默认去重） |
 
 ### 单点模式（与 `--coords-file` 互斥）

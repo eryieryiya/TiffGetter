@@ -224,6 +224,12 @@ class RunnerMixin:
             self._set_running(False)
             self.status_var.set("已停止")
 
+    def _on_close(self):
+        """关闭主窗口：终止仍在运行的下载子进程后销毁窗口。"""
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+        self.root.destroy()
+
     def _on_done(self):
         self._set_running(False)
         if self._stopping:

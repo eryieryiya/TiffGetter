@@ -107,8 +107,8 @@ def get_tile_coords(lat: float, lon: float, zoom: int,
 
     # 经度方向按纬度做 cos 修正，保证东西向距离正确
     cos_lat = max(math.cos(math.radians(lat)), 1e-6)
-    half_lon_deg = (buffer_size / 2) / (111320.0 * cos_lat)
-    half_lat_deg = (buffer_size / 2) / 111320.0
+    half_lon_deg = buffer_size / (111320.0 * cos_lat)
+    half_lat_deg = buffer_size / 111320.0
 
     # ----- 防「buffer_size 被当成度」的二次防线 -----
     # 合法 buffer_size（米）换算后的半纬范围，即使 200km 也只有 ~1.8°；
@@ -158,8 +158,8 @@ def _buffer_wgs84_rect(lat: float, lon: float,
     (clip_min_lon, clip_min_lat, clip_max_lon, clip_max_lat)。
     """
     cos_lat = max(math.cos(math.radians(lat)), 1e-6)
-    half_lon = (buffer_size / 2.0) / (111320.0 * cos_lat)
-    half_lat = (buffer_size / 2.0) / 111320.0
+    half_lon = buffer_size / (111320.0 * cos_lat)
+    half_lat = buffer_size / 111320.0
     clip_min_lon = lon - half_lon
     clip_max_lon = lon + half_lon
     clip_min_lat = lat - half_lat  # 更南
