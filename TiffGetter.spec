@@ -44,8 +44,7 @@ if _gdal_share:
     datas.append((_gdal_share, 'gdal_data'))
     print(f'[*] 打包 GDAL 数据: {_gdal_share} -> gdal_data')
 else:
-    print('[!] 未找到 conda GDAL 数据目录（Library/share/gdal），'
-          'GeoTIFF 输出可能受限')
+    print('[!] 未找到 conda GDAL 数据目录，使用 rasterio wheel 自带 GDAL/PROJ 数据')
 
 # 3) rasterio wheel 自带的 proj.db 与 GDAL 数据（无官方 hook，必须手动收集）
 _rasterio_datas = collect_data_files(

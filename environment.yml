@@ -4,9 +4,10 @@ channels:
   - defaults      # conda 默认 channel，作为兜底
 dependencies:
   - python=3.13   # 固定 Python 版本；3.13 已验证可与下方所有依赖兼容
-  # ---- 地理/栅格处理核心（通过 conda 安装以避免 C 扩展编译问题） ----
-  - gdal          # GIS 基底层（地理转换、栅格读写），rasterio/pyproj 等均间接依赖
-  - pip           # 用 pip 安装 PyPI 上的 ttkbootstrap 等 GUI/工具包
+  # ---- 地理/栅格处理核心 ----
+  # 不安装 conda gdal：pip 版 rasterio wheel 自带精简 GDAL/PROJ，
+  # 避免 PyInstaller 把完整 conda GDAL 栈打进 exe（体积可从 265MB 降到约 80MB）
+  - pip           # 用 pip 安装 rasterio、ttkbootstrap 等包
   - pip:
     # ---- 通用基础 ----
     - requests    # 网络请求（下载瓦片、查询 Wayback 版本元数据）
