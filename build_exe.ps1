@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     将 TiffGetter 打包为独立 exe（PyInstaller onefile，GUI + CLI 统一入口）。
 
