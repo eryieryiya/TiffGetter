@@ -72,7 +72,20 @@ jobs:
           }
 
       - name: Verify CLI entry
-        run: .\dist\TiffGetter.exe --help
+        run: |
+          $oldEap = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          try {
+            $out = & .\dist\TiffGetter.exe --help 2>&1 | Out-String
+            $code = $LASTEXITCODE
+          } finally {
+            $ErrorActionPreference = $oldEap
+          }
+          Write-Host $out
+          if ($code -ne 0) {
+            Write-Host "::error title=CLI verify failed ($code)::$($out -replace '%','%25' -replace '\r?\n','%0A')"
+            exit $code
+          }
 
       - name: Prepare release files
         id: package

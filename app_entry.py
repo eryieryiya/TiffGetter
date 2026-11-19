@@ -81,7 +81,17 @@ def _is_cli_invocation(argv):
     return True
 
 
+def _force_utf8_streams():
+    """避免在 cp1252 等非中文控制台下打印中文时抛 UnicodeEncodeError。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+
 def main():
+    _force_utf8_streams()
     _setup_geo_env()
 
     if _is_cli_invocation(sys.argv):
