@@ -147,7 +147,7 @@ New York,liberty,40.6892,-74.0445
 # 单点：输出到宿主机 ./out
 docker run --rm \
   -v "$PWD/out:/app/data/output" \
-  ghcr.io/eryieryiya/tiffgetter:v0.1.3 \
+  ghcr.io/eryieryiya/tiffgetter:v0.1.4 \
   --source esri --lat 35.6586 --lon 139.7454 --zoom 15 --buffer 300
 
 # 批量：挂载坐标文件
@@ -347,6 +347,46 @@ data/output/esri/                     # 非历史源
 - `diagnostics`：包含 `by_kind`（失败类型 → 数量）、`failed_tiles`（失败瓦片总数）、`samples`（前 3 条失败样本，含 `kind`、`http_status`、`url`、`detail`）。
 - `metadata_source`：元数据来源，取值为 `online`（在线拉取）、`cache`（24 小时磁盘缓存）、`fallback`（在线不可用时回退内置列表）、`native`（数据源原生元数据）。
 - `metadata_fetched_at`：元数据获取时间（ISO 8601）。
+
+### 失败提示
+
+运行结束后，CLI 按失败分类汇总并输出「失败提示」，每条包含分类、数量与可执行建议：
+
+```
+失败提示:
+  forbidden (3)：访问被拒绝（403），该源可能限制当前区域或请求频率，请稍后重试或改用其他数据源
+  rate_limited (12)：请求过多（429），请降低并发数或稍后重试
+  timeout (2)：请求超时，请检查网络或代理设置后稍后重试
+```
+
+单点与批量模式都会输出该摘要；没有失败时不显示。
+
+### 批量失败清单
+
+批量模式在摘要之后列出失败坐标及其失败分类，便于定位具体点位：
+
+```
+失败坐标:
+  tokyo_tower (35.658600, 139.745400)：rate_limited, timeout
+```
+
+同一坐标存在多种失败分类时按类型名排序输出；没有失败坐标时不显示该段。
+
+### 实时输出
+
+每个 release 完成后立即输出日志（失败时附带分类提示与瓦片上下文），启用 `--events` 时同时输出一条 `date_result` 事件，无需等待整轮结束。`date_result` 包含：
+
+- `failed_tiles`：该 release 的失败瓦片总数
+- `tile_failure_counts`：失败类型 → 数量
+- `samples`：前 3 条失败样本（含 `kind`、`http_status`、`url`、`detail`）
+
+### 下载前预检
+
+下载开始前执行以下预检并输出提示：
+
+- `rasterio` 不可用时提示本次仅输出 PNG（不生成 GeoTIFF）。
+- 检测到 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 环境变量时提示下载失败请检查代理设置。
+- 输出目录无法创建时打印错误并以退出码 2 结束。
 
 ## 版权与使用限制
 

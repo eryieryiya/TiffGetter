@@ -15,7 +15,7 @@ import numpy as np
 import warnings
 from config import WGS84_WKT, THREAD_POOL_SIZE
 from core import dedup, geo, release, events
-from core.errors import FailureKind, ProviderError, TileBatchStats
+from core.errors import FailureKind, ProviderError, TileBatchStats, failure_hint
 from providers.registry import DEFAULT_SOURCE, get_source
 from utils.cleanup import (
     cleanup_stale_temp_tiles,
@@ -35,10 +35,12 @@ try:
     import rasterio  # noqa: F401
     from rasterio.transform import from_bounds
     _RASTERIO_AVAILABLE = True
+    HAS_RASTERIO = True
 except Exception:
     # rasterio 不可用时降级：仅输出 PNG，不打印导入异常
     rasterio = None
     from_bounds = None
+    HAS_RASTERIO = False
 
 # 关闭 ESRI wayback 域名的 SSL 警告（其证书链有时触发告警）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -699,6 +701,37 @@ class ImageFetcher:
     # ------------------------------------------------------------------
     # 批量入口
     # ------------------------------------------------------------------
+    def _emit_result(self, result: Dict, coord_index=None) -> None:
+        """输出单条 date_result 事件，包含瓦片级失败上下文。"""
+        failures = result.get('failures') or []
+        tile_counts = {}
+        for failure in failures:
+            key = failure.kind.value if failure.kind else 'internal'
+            tile_counts[key] = tile_counts.get(key, 0) + 1
+        samples = [
+            {
+                'kind': failure.kind.value if failure.kind else 'internal',
+                'http_status': failure.http_status,
+                'url': failure.url,
+                'detail': failure.detail,
+            }
+            for failure in failures[:3]
+        ]
+        kind = result.get('failure_kind')
+        events.emit({
+            'type': 'date_result',
+            'coord_index': coord_index,
+            'date': result.get('date'),
+            'name': result.get('name'),
+            'status': result.get('status'),
+            'kind': kind.value if isinstance(kind, FailureKind) else None,
+            'detail': result.get('detail', ''),
+            'path': result.get('file_path'),
+            'failed_tiles': len(failures),
+            'tile_failure_counts': tile_counts,
+            'samples': samples,
+        })
+
     def _emit_results(self, results: List[Dict], coord_index=None) -> None:
         """把结果列表转换为 date_result 事件。
 
@@ -709,17 +742,35 @@ class ImageFetcher:
             None。逐条通过 events.emit 输出 date_result 事件。
         """
         for result in results:
-            kind = result.get('failure_kind')
-            events.emit({
-                'type': 'date_result',
-                'coord_index': coord_index,
-                'date': result.get('date'),
-                'name': result.get('name'),
-                'status': result.get('status'),
-                'kind': kind.value if isinstance(kind, FailureKind) else None,
-                'detail': result.get('detail', ''),
-                'path': result.get('file_path'),
-            })
+            self._emit_result(result, coord_index)
+
+    def _log_failure_context(self, result: Dict) -> None:
+        """在失败结果产生时立即输出分类提示与瓦片上下文。"""
+        kind = result.get('failure_kind')
+        hint = failure_hint(kind)
+        logger.warning(f"[失败] {result.get('date')}: {result.get('detail') or '下载失败'}")
+        if hint:
+            logger.warning(f"  提示: {hint}")
+        failures = result.get('failures') or []
+        if failures:
+            counts = {}
+            for failure in failures:
+                key = failure.kind.value if failure.kind else 'internal'
+                counts[key] = counts.get(key, 0) + 1
+            logger.warning(
+                f"  失败瓦片: {len(failures)} 张（"
+                f"{', '.join(f'{k}={v}' for k, v in sorted(counts.items()))}）"
+            )
+            logger.warning(f"  示例: {failures[0].url or '无'}")
+
+    def _record_result(self, results: List[Dict], result: Dict,
+                       emit_events: bool, coord_index=None) -> None:
+        """记录单条结果；失败时立即提示，按需立即发事件。"""
+        results.append(result)
+        if result.get('status') == 'failed':
+            self._log_failure_context(result)
+        if emit_events:
+            self._emit_result(result, coord_index)
 
     def fetch_all(self, lat: float, lon: float, zoom: int = 18,
                   output_dir: str = 'data/output/historical',
@@ -757,6 +808,7 @@ class ImageFetcher:
                 'detail': e.detail,
                 'failures': [],
             }]
+            self._log_failure_context(results[0])
             if emit_events:
                 self._emit_results(results, event_coord)
             return results
@@ -773,6 +825,7 @@ class ImageFetcher:
                 'detail': '没有可用 release',
                 'failures': [],
             }]
+            self._log_failure_context(results[0])
             if emit_events:
                 self._emit_results(results, event_coord)
             return results
@@ -827,12 +880,12 @@ class ImageFetcher:
                 if not dedup:
                     skipped_existing += 1
                     logger.info(f"已存在文件，跳过下载: {date_str}")
-                    results.append({
+                    self._record_result(results, {
                         'date': date_str,
                         'name': date_info.get('name', date_str),
                         'status': 'existing',
                         'file_path': tif_path if os.path.exists(tif_path) else None,
-                    })
+                    }, emit_events, event_coord)
                     continue
                 is_dup, img_md5, img_dhash = self._is_duplicate_image(
                     png_path,
@@ -842,12 +895,12 @@ class ImageFetcher:
                 if is_dup:
                     logger.info(f"[感知去重] {date_str} 与已保存版本视觉相同，标记重复")
                     skipped_duplicates += 1
-                    results.append({
+                    self._record_result(results, {
                         'date': date_str,
                         'name': date_info.get('name', date_str),
                         'status': 'duplicate',
                         'file_path': tif_path if os.path.exists(tif_path) else None,
-                    })
+                    }, emit_events, event_coord)
                     continue
                 # 非重复：把当前文件的 hash 登记，避免新下的覆盖它
                 if img_md5:
@@ -856,12 +909,12 @@ class ImageFetcher:
                     self._downloaded_dhashes.add(img_dhash)
                 skipped_existing += 1
                 logger.info(f"已存在文件，跳过下载: {date_str}")
-                results.append({
+                self._record_result(results, {
                     'date': date_str,
                     'name': date_info.get('name', date_str),
                     'status': 'existing',
                     'file_path': tif_path if os.path.exists(tif_path) else None,
-                })
+                }, emit_events, event_coord)
                 continue
 
             # ---------- 新下载：启用中心瓦片预筛 ----------
@@ -871,14 +924,17 @@ class ImageFetcher:
             )
 
             if result is None:
-                results.append({
+                self._record_result(results, {
                     'date': date_str,
                     'name': date_info.get('name', date_str),
                     'status': 'failed',
                     'file_path': None,
-                })
+                    'failure_kind': FailureKind.INTERNAL,
+                    'detail': '下载返回空结果',
+                    'failures': [],
+                }, emit_events, event_coord)
             elif result['status'] == 'failed':
-                results.append({
+                self._record_result(results, {
                     'date': date_str,
                     'name': date_info.get('name', date_str),
                     'status': 'failed',
@@ -886,22 +942,22 @@ class ImageFetcher:
                     'failure_kind': result['failure_kind'],
                     'detail': result['detail'],
                     'failures': result['failures'],
-                })
+                }, emit_events, event_coord)
             elif result['status'] == 'duplicate':
                 skipped_duplicates += 1
-                results.append({
+                self._record_result(results, {
                     'date': date_str,
                     'name': date_info.get('name', date_str),
                     'status': 'duplicate',
                     'file_path': None,
-                })
+                }, emit_events, event_coord)
             else:
-                results.append({
+                self._record_result(results, {
                     'date': date_str,
                     'name': date_info.get('name', date_str),
                     'status': 'success',
                     'file_path': result['path'],
-                })
+                }, emit_events, event_coord)
             time.sleep(0.3)
 
         # 清理：预筛目录用完即销毁（其内容对用户无意义）
@@ -955,9 +1011,6 @@ class ImageFetcher:
                     f"{k}={v}" for k, v in sorted(failure_counts.items())
                 )
             )
-
-        if emit_events:
-            self._emit_results(results, event_coord)
 
         return results
 

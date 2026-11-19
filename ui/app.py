@@ -54,6 +54,7 @@ class App(ThemeMixin, RunnerMixin, MapPickerMixin,
         self.process: Optional[subprocess.Popen] = None
         self.log_queue: queue.Queue = queue.Queue()
         self._stopping = False
+        self._failure_details = {}
 
         # ----- 主题偏好加载 -----
         try:
@@ -251,9 +252,21 @@ class App(ThemeMixin, RunnerMixin, MapPickerMixin,
         self.result_tree.config(yscrollcommand=rsb.set)
         self.result_tree.bind('<Double-1>', self._open_selected_path)
 
+        # ---------- 运行结束横幅 ----------
+        self.run_banner = ttk.Frame(self.root)
+        self.run_banner_label = self._lbl(self.run_banner, text="", padding=(8, 4))
+        self.run_banner_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.run_banner_btn = self._btn(
+            self.run_banner, text="查看失败详情",
+            style=SECONDARY, command=self._show_failure_details, ipad=2,
+        )
+        self.run_banner_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self.run_banner.pack(fill=tk.X, padx=8, pady=(4, 0))
+
         # ---------- 底部共享区：进度条 + 日志面板 ----------
         bottom = ttk.Frame(self.root, padding=(8, 4))
         bottom.pack(fill=tk.BOTH, expand=True)
+        self._bottom_frame = bottom
 
         # 进度条
         prog_frame = ttk.Frame(bottom)
@@ -326,6 +339,9 @@ class App(ThemeMixin, RunnerMixin, MapPickerMixin,
             padding=(8, 2), relief=tk.SUNKEN,
         )
         self.source_status_lbl.pack(side=tk.RIGHT, padx=(0, 4))
+
+        # 默认隐藏运行结束横幅（运行结束后再显示）
+        self.run_banner.pack_forget()
 
         # 按初始数据源应用一次联动
         self._apply_source(self._current_source_name())

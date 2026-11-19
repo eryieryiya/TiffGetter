@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from core import events
-from core.errors import FailureKind
+from core.errors import FailureKind, TileResult
 
 
 def test_emit_and_parse(capsys):
@@ -41,7 +41,19 @@ def test_image_fetcher_emit_results(fetcher_factory, capsys):
             'file_path': None,
             'failure_kind': FailureKind.FORBIDDEN,
             'detail': 'HTTP 403',
-            'failures': [],
+            'failures': [
+                TileResult.failure(
+                    FailureKind.FORBIDDEN,
+                    'HTTP 403',
+                    url='https://example.invalid/a.png',
+                    http_status=403,
+                ),
+                TileResult.failure(
+                    FailureKind.TIMEOUT,
+                    'read timeout',
+                    url='https://example.invalid/b.png',
+                ),
+            ],
         },
     ]
 
@@ -56,8 +68,16 @@ def test_image_fetcher_emit_results(fetcher_factory, capsys):
     assert parsed[0]['status'] == 'success'
     assert parsed[0]['kind'] is None
     assert parsed[0]['path'] == 'out/2015-06-01/2015-06-01.tif'
+    assert parsed[0]['failed_tiles'] == 0
+    assert parsed[0]['tile_failure_counts'] == {}
+    assert parsed[0]['samples'] == []
     assert parsed[1]['type'] == 'date_result'
     assert parsed[1]['coord_index'] == 2
     assert parsed[1]['status'] == 'failed'
     assert parsed[1]['kind'] == 'forbidden'
     assert parsed[1]['path'] is None
+    assert parsed[1]['failed_tiles'] == 2
+    assert parsed[1]['tile_failure_counts'] == {'forbidden': 1, 'timeout': 1}
+    assert len(parsed[1]['samples']) == 2
+    assert parsed[1]['samples'][0]['url'] == 'https://example.invalid/a.png'
+    assert parsed[1]['samples'][0]['http_status'] == 403

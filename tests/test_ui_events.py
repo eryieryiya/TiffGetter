@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from ui.app import App
+from ui.runner import failure_detail_text, run_banner_text
 
 
 class FakeTree:
@@ -27,6 +30,7 @@ def _make_app():
     """构造已绑定假结果树的 App 实例，并跳过进度更新。"""
     app = object.__new__(App)
     app.result_tree = FakeTree()
+    app._failure_details = {}
     app._update_progress_fine = lambda: None
     return app
 
@@ -165,3 +169,75 @@ def test_parse_result_line_batch_columns():
     values, tags = app.result_tree.rows[0]
     assert values == ('NYC', '✅ success', '', '40.7128,-74.0060 成功 1/2')
     assert 'row_success' in tags
+
+
+@pytest.mark.parametrize(
+    'code,expected',
+    [
+        (0, ('✅ 运行完成：全部成功', False)),
+        (2, ('⚠️ 参数或输入错误，请检查配置', False)),
+        (3, ('⚠️ 部分日期失败，请查看失败详情', True)),
+        (4, ('❌ 全部日期失败，请查看失败详情', True)),
+        (5, ('❌ 外部接口可能已变更，请更新程序或改用其他数据源', True)),
+        (None, ('运行结束：未获取退出码', False)),
+        (99, ('运行结束（退出码 99）', False)),
+    ],
+)
+def test_run_banner_text(code, expected):
+    """退出码映射到对应横幅文案与详情按钮可见性。"""
+    assert run_banner_text(code) == expected
+
+
+def test_failure_detail_text():
+    """失败事件字典转换为含原因、详情、瓦片分类和样本的文本。"""
+    event = {
+        'type': 'date_result',
+        'date': '2024-01-02',
+        'name': 'NYC',
+        'status': 'failed',
+        'kind': 'forbidden',
+        'detail': 'HTTP 403',
+        'failed_tiles': 2,
+        'tile_failure_counts': {'forbidden': 1, 'timeout': 1},
+        'samples': [
+            {
+                'kind': 'forbidden',
+                'http_status': 403,
+                'url': 'https://example.invalid/a.png',
+                'detail': 'HTTP 403',
+            },
+        ],
+    }
+
+    text = failure_detail_text({'NYC': event})
+
+    assert '== NYC ==' in text
+    assert '原因: 访问被拒绝 (403)' in text
+    assert '详情: HTTP 403' in text
+    assert '失败瓦片: 2 张' in text
+    assert '分类: forbidden=1, timeout=1' in text
+    assert '[forbidden] HTTP 403 https://example.invalid/a.png' in text
+
+
+def test_failure_detail_text_empty():
+    """空失败字典返回无详情提示。"""
+    assert failure_detail_text({}) == '本次运行没有可用的失败详情'
+
+
+def test_failed_event_stores_detail():
+    """failed 事件写入失败详情，run_summary 不写入。"""
+    app = _make_app()
+    event = {
+        'type': 'date_result',
+        'coord_index': 1,
+        'date': '2024-01-01',
+        'name': 'NYC',
+        'status': 'failed',
+        'kind': 'timeout',
+        'detail': 'Read timeout',
+    }
+
+    app._handle_event(event)
+    app._handle_event({'type': 'run_summary', 'total': 1})
+
+    assert app._failure_details == {'NYC': event}

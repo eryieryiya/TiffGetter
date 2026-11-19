@@ -8,6 +8,7 @@
 
 参数：--source / --zoom / --buffer / --output / --date-range / --coord-concurrency
 """
+import os
 import sys
 import logging
 import argparse
@@ -27,7 +28,8 @@ from providers.registry import (
 from satellite_processor import ImageFetcher
 from coordinate_loader import load_coordinates_file, CoordinateLoadError
 from core import events
-from core.errors import FailureKind
+from core.errors import FailureKind, failure_hint
+from core.fetch import HAS_RASTERIO
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,6 +103,54 @@ def _failure_counts(results):
         key = kind.value if isinstance(kind, FailureKind) else 'internal'
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _print_failure_hints(counts):
+    """按失败分类输出操作建议。"""
+    if not counts:
+        return
+    print("\n失败提示:")
+    for key, count in counts.items():
+        hint = failure_hint(key)
+        if hint:
+            print(f"  {key} ({count})：{hint}")
+
+
+def _batch_failure_lines(summary):
+    """返回批量失败坐标及失败分类的文本行列表。"""
+    lines = []
+    for s in summary:
+        kinds = set()
+        for r in s['results']:
+            if r.get('status') != 'failed':
+                continue
+            kind = r.get('failure_kind')
+            kinds.add(kind.value if isinstance(kind, FailureKind) else 'internal')
+        if kinds:
+            lines.append(
+                f"{s['name']} ({s['lat']:.6f}, {s['lon']:.6f})："
+                f"{', '.join(sorted(kinds))}"
+            )
+    return lines
+
+
+def _preflight_hints(output_dir):
+    """输出下载前提示并确保输出目录可创建。"""
+    if not HAS_RASTERIO:
+        print("提示：rasterio 不可用，本次将仅输出 PNG（不生成 GeoTIFF）")
+    names = [
+        name for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY')
+        if os.environ.get(name)
+    ]
+    if names:
+        print(f"提示：检测到代理环境变量 {', '.join(names)}，下载失败时请检查代理设置")
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        print(f"错误：无法创建输出目录 {output_dir}: {e}")
+        print("提示：请检查路径权限或磁盘空间")
+        return False
+    return True
 
 
 def _compute_exit_code(results):
@@ -207,6 +257,9 @@ def main():
             print(f"错误：lon 越界 {args.lon}，需 ∈ [-180, 180]", file=sys.stderr)
             sys.exit(2)
 
+    if not _preflight_hints(output_dir):
+        sys.exit(2)
+
     fetcher = ImageFetcher(source=args.source, dedup=not args.no_dedup)
 
     if args.coords_file:
@@ -248,6 +301,12 @@ def main():
         flat_results = []
         for s in summary:
             flat_results.extend(s['results'])
+        _print_failure_hints(_failure_counts(flat_results))
+        lines = _batch_failure_lines(summary)
+        if lines:
+            print("\n失败坐标:")
+            for line in lines:
+                print(f"  {line}")
         if args.events:
             events.emit({
                 'type': 'run_summary',
@@ -281,6 +340,7 @@ def main():
 
         success = sum(1 for r in results if r['status'] == 'success')
         failed = sum(1 for r in results if r['status'] == 'failed')
+        _print_failure_hints(_failure_counts(results))
         if args.events:
             events.emit({
                 'type': 'run_summary',

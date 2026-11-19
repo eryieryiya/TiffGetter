@@ -10,10 +10,11 @@ import re
 from typing import List
 
 import tkinter as tk
+from tkinter import ttk
 
 from core.events import parse as parse_event
 from ui import BASE_DIR
-from ui.theme import HAS_TTKBOOTSTRAP, SUCCESS
+from ui.theme import HAS_TTKBOOTSTRAP, SUCCESS, SECONDARY
 
 FAILURE_LABELS = {
     'no_releases': '无可用版本',
@@ -31,6 +32,53 @@ FAILURE_LABELS = {
     'interface_changed': '外部接口已变更',
     'internal': '内部错误',
 }
+
+RUN_BANNER_MAP = {
+    0: ('✅ 运行完成：全部成功', False),
+    2: ('⚠️ 参数或输入错误，请检查配置', False),
+    3: ('⚠️ 部分日期失败，请查看失败详情', True),
+    4: ('❌ 全部日期失败，请查看失败详情', True),
+    5: ('❌ 外部接口可能已变更，请更新程序或改用其他数据源', True),
+}
+
+
+def run_banner_text(returncode):
+    """返回运行结束横幅文案与是否显示详情按钮。"""
+    if returncode is None:
+        return ('运行结束：未获取退出码', False)
+    if returncode in RUN_BANNER_MAP:
+        return RUN_BANNER_MAP[returncode]
+    return (f'运行结束（退出码 {returncode}）', False)
+
+
+def failure_detail_text(details):
+    """把失败事件字典转换为可复制的详情文本。"""
+    if not details:
+        return '本次运行没有可用的失败详情'
+    lines = []
+    for name in sorted(details):
+        event = details[name]
+        kind = event.get('kind') or ''
+        reason = FAILURE_LABELS.get(kind) or kind or '未知'
+        detail = event.get('detail') or '无'
+        failed_tiles = event.get('failed_tiles') or 0
+        counts = event.get('tile_failure_counts') or {}
+        counts_text = ', '.join(
+            f'{key}={counts[key]}' for key in sorted(counts)
+        )
+        lines.append(f'== {name} ==')
+        lines.append(f'原因: {reason}')
+        lines.append(f'详情: {detail}')
+        lines.append(f'失败瓦片: {failed_tiles} 张')
+        lines.append(f'分类: {counts_text}')
+        lines.append('示例:')
+        for sample in event.get('samples') or []:
+            lines.append(
+                f"  [{sample.get('kind', '')}] HTTP "
+                f"{sample.get('http_status')} {sample.get('url', '')}"
+            )
+        lines.append('')
+    return '\n'.join(lines)
 
 
 def _build_cli_cmd(extra_args: List[str]) -> List[str]:
@@ -172,6 +220,11 @@ class RunnerMixin:
         self.result_tree.insert('', tk.END,
             values=(label, status_txt, reason, path),
             tags=(row_tag,))
+        if status == 'failed':
+            failure_label = (
+                event.get('name') or event.get('date') or '未命名'
+            )
+            self._failure_details[failure_label] = event
         self._update_progress_fine()
 
     def _update_progress_fine(self):
@@ -230,6 +283,8 @@ class RunnerMixin:
     # ------------------------------------------------------------------
     def _set_running(self, running: bool):
         if running:
+            self._failure_details = {}
+            self.run_banner.pack_forget()
             self.start_single_btn.config(state=tk.DISABLED)
             self.start_batch_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
@@ -243,6 +298,7 @@ class RunnerMixin:
             creationflags = 0
             if os.name == 'nt':
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            returncode = None
             try:
                 self.process = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -251,12 +307,12 @@ class RunnerMixin:
                 )
                 for line in self.process.stdout:
                     self.log_msg(line.rstrip())
-                self.process.wait()
+                returncode = self.process.wait()
             except Exception as e:
                 self.log_msg(f"启动子进程失败: {e}")
             finally:
                 self.process = None
-                self.root.after(0, self._on_done)
+                self.root.after(0, lambda code=returncode: self._on_done(code))
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -286,7 +342,7 @@ class RunnerMixin:
             self.process.terminate()
         self.root.destroy()
 
-    def _on_done(self):
+    def _on_done(self, returncode=None):
         self._set_running(False)
         if self._stopping:
             self.status_var.set("已停止")
@@ -302,6 +358,63 @@ class RunnerMixin:
                     self.progress.configure(bootstyle=f"{SUCCESS}-striped")
                 except Exception:
                     pass
+            self._update_run_banner(returncode)
+
+    def _update_run_banner(self, returncode):
+        """按退出码刷新运行结束横幅，并按需显示失败详情按钮。"""
+        text, show_button = run_banner_text(returncode)
+        self.run_banner_label.configure(text=text)
+        self.run_banner.pack(
+            fill=tk.X, padx=8, pady=(4, 0), before=self._bottom_frame
+        )
+        if show_button:
+            self.run_banner_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        else:
+            self.run_banner_btn.pack_forget()
+
+    def _show_failure_details(self):
+        """弹出失败详情窗口，展示失败事件并支持复制与关闭。"""
+        details = getattr(self, '_failure_details', {})
+        if not details:
+            details = {}
+            for iid in self.result_tree.get_children():
+                vals = self.result_tree.item(iid, 'values')
+                if len(vals) > 1 and vals[1] == '❌ failed':
+                    name = vals[0] or '未命名'
+                    reason = vals[2] if len(vals) > 2 else ''
+                    details[name] = {'kind': '', 'detail': reason}
+        text = failure_detail_text(details)
+
+        win = tk.Toplevel(self.root)
+        win.title("失败详情")
+        win.geometry("760x460")
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        text_widget = tk.Text(win, wrap=tk.WORD)
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(win, command=text_widget.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text_widget.config(yscrollcommand=scrollbar.set)
+        text_widget.insert(tk.END, text)
+        text_widget.config(state=tk.DISABLED)
+
+        def _copy_details():
+            """把详情文本复制到剪贴板，并短暂提示已复制。"""
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            copy_btn.configure(text="已复制")
+            win.after(1500, lambda: copy_btn.configure(text="复制"))
+
+        copy_btn = self._btn(
+            btn_frame, text="复制", style=SECONDARY,
+            command=_copy_details, ipad=2,
+        )
+        copy_btn.pack(side=tk.LEFT, padx=4, pady=4)
+        self._btn(
+            btn_frame, text="关闭", command=win.destroy, ipad=2,
+        ).pack(side=tk.RIGHT, padx=4, pady=4)
 
     def _open_selected_path(self, _event):
         iid = self.result_tree.focus()

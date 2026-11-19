@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+import core.fetch
 import satellite_processor
 import utils.cleanup as cleanup_utils
 from core.errors import FailureKind, TileBatchStats, TileResult
@@ -274,3 +276,50 @@ def test_download_tiles_batch_returns_stats(tmp_path, fetcher_factory, monkeypat
     assert stats.available == 1
     assert len(stats.failures) == 1
     assert stats.failures[0].kind == FailureKind.TIMEOUT
+
+
+def test_record_result_emits_immediately(fetcher_factory, monkeypatch):
+    """_record_result 追加结果，并在 emit_events 时立即发出 date_result 事件。"""
+    fetcher = fetcher_factory()
+    emitted = []
+    monkeypatch.setattr(core.fetch.events, "emit", lambda event: emitted.append(event))
+    results = []
+
+    fetcher._record_result(results, {
+        "date": "2024-01-01",
+        "status": "failed",
+        "failure_kind": FailureKind.FORBIDDEN,
+        "detail": "HTTP 403",
+        "failures": [],
+    }, True, 1)
+
+    assert len(results) == 1
+    assert len(emitted) == 1
+    assert emitted[0]["type"] == "date_result"
+    assert emitted[0]["kind"] == "forbidden"
+    assert emitted[0]["coord_index"] == 1
+
+
+def test_failure_log_contains_hint_and_sample(fetcher_factory, caplog):
+    """失败上下文日志包含操作建议与示例 URL。"""
+    fetcher = fetcher_factory()
+    result = {
+        "date": "2024-01-01",
+        "status": "failed",
+        "failure_kind": FailureKind.FORBIDDEN,
+        "detail": "HTTP 403",
+        "failures": [
+            TileResult.failure(
+                FailureKind.FORBIDDEN,
+                "HTTP 403",
+                url="https://example.invalid/a.png",
+                http_status=403,
+            ),
+        ],
+    }
+
+    with caplog.at_level(logging.WARNING):
+        fetcher._log_failure_context(result)
+
+    assert "提示:" in caplog.text
+    assert "示例:" in caplog.text
