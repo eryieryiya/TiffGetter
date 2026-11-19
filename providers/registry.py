@@ -15,6 +15,7 @@ _SOURCES: Dict[str, SourceInfo] = {
         max_zoom=20,
         max_concurrency=10,
         attribution='Esri World Imagery Wayback',
+        verify_tls=False,
     ),
     'esri': SourceInfo(
         name='esri',
@@ -24,6 +25,7 @@ _SOURCES: Dict[str, SourceInfo] = {
         max_zoom=18,
         max_concurrency=8,
         attribution='Esri World Imagery',
+        verify_tls=False,
     ),
     'google': SourceInfo(
         name='google',

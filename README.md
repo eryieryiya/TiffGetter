@@ -146,7 +146,7 @@ New York,liberty,40.6892,-74.0445
 # 单点：输出到宿主机 ./out
 docker run --rm \
   -v "$PWD/out:/app/data/output" \
-  ghcr.io/eryieryiya/tiffgetter:v0.1.1 \
+  ghcr.io/eryieryiya/tiffgetter:v0.1.2 \
   --source esri --lat 35.6586 --lon 139.7454 --zoom 15 --buffer 300
 
 # 批量：挂载坐标文件

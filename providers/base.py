@@ -19,13 +19,14 @@ class SourceInfo:
     attribution: str
     experimental: bool = False
     usage_note: str = ""
+    verify_tls: bool = True
 
 
 class UnknownSourceError(ValueError):
     """请求了未注册的数据源。"""
 
 
-def build_session() -> requests.Session:
+def build_session(verify_tls: bool = True) -> requests.Session:
     """创建带重试的 requests 会话（沿用现有 HTTPAdapter 配置）。"""
     adapter = requests.adapters.HTTPAdapter(
         pool_connections=10,
@@ -36,7 +37,7 @@ def build_session() -> requests.Session:
     )
     session = requests.Session()
     session.mount('https://', adapter)
-    session.verify = False
+    session.verify = verify_tls
     return session
 
 
@@ -49,7 +50,7 @@ class TileSource(ABC):
 
     def __init__(self, info: SourceInfo):
         self.info = info
-        self.session = build_session()
+        self.session = build_session(verify_tls=info.verify_tls)
 
     @abstractmethod
     def available_releases(self, lat: float, lon: float, zoom: int) -> List[Dict]:

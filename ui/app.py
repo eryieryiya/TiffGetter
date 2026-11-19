@@ -122,7 +122,7 @@ class App(ThemeMixin, RunnerMixin, MapPickerMixin,
         style: bootstyle 名
         extra: 仅传给 ttkbootstrap 的额外参数（如 Checkbutton 的 variable）
         """
-        if HAS_TTKBOOTSTRAP:
+        if HAS_TTKBOOTSTRAP and tb_cls is not None:
             bs_kw = {"bootstyle": style} if style else {}
             try:
                 if extra:
@@ -139,22 +139,26 @@ class App(ThemeMixin, RunnerMixin, MapPickerMixin,
 
     def _btn(self, parent, text, command=None, style=None, **kw):
         """统一构造按钮。"""
-        return self._tk("btn", parent, tb_cls=tb.Button, ttk_cls=ttk.Button,
+        tb_cls = tb.Button if HAS_TTKBOOTSTRAP else None
+        return self._tk("btn", parent, tb_cls=tb_cls, ttk_cls=ttk.Button,
                         style=style, extra={"text": text, "command": command}, **kw)
 
     def _lbl(self, parent, text="", style=None, **kw):
         """统一构造标签。"""
-        return self._tk("lbl", parent, tb_cls=tb.Label, ttk_cls=ttk.Label,
+        tb_cls = tb.Label if HAS_TTKBOOTSTRAP else None
+        return self._tk("lbl", parent, tb_cls=tb_cls, ttk_cls=ttk.Label,
                         style=style, extra={"text": text}, **kw)
 
     def _cb(self, parent, text="", variable=None, style=None, **kw):
         """统一构造复选框。"""
-        return self._tk("cb", parent, tb_cls=tb.Checkbutton, ttk_cls=ttk.Checkbutton,
+        tb_cls = tb.Checkbutton if HAS_TTKBOOTSTRAP else None
+        return self._tk("cb", parent, tb_cls=tb_cls, ttk_cls=ttk.Checkbutton,
                         style=style, extra={"text": text, "variable": variable}, **kw)
 
     def _pb(self, parent, style=None, **kw):
         """统一构造进度条。"""
-        return self._tk("pb", parent, tb_cls=tb.Progressbar, ttk_cls=ttk.Progressbar,
+        tb_cls = tb.Progressbar if HAS_TTKBOOTSTRAP else None
+        return self._tk("pb", parent, tb_cls=tb_cls, ttk_cls=ttk.Progressbar,
                         style=style, **kw)
 
     def _build_ui(self):
