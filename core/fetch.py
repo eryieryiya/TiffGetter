@@ -14,7 +14,8 @@ from typing import List, Dict, Tuple, Optional
 import numpy as np
 import warnings
 from config import WGS84_WKT, THREAD_POOL_SIZE
-from core import dedup, geo, release
+from core import dedup, geo, release, events
+from core.errors import FailureKind, ProviderError, TileBatchStats
 from providers.registry import DEFAULT_SOURCE, get_source
 from utils.cleanup import (
     cleanup_stale_temp_tiles,
@@ -34,12 +35,8 @@ try:
     import rasterio  # noqa: F401
     from rasterio.transform import from_bounds
     _RASTERIO_AVAILABLE = True
-except Exception as _ra:
-    # 记录真实失败原因（打包态常见：DLL 缺失 / 数据文件路径问题），
-    # 避免只留下"请安装 rasterio"的猜测性提示
-    import traceback as _tb
-    _tb.print_exc()
-    print(f"[rasterio 导入失败] {type(_ra).__name__}: {_ra}")
+except Exception:
+    # rasterio 不可用时降级：仅输出 PNG，不打印导入异常
     rasterio = None
     from_bounds = None
 
@@ -179,43 +176,46 @@ class ImageFetcher:
     # 瓦片下载
     # ------------------------------------------------------------------
     def download_tiles_batch(self, tile_coords: List[Tuple[int, int]], zoom: int,
-                             temp_dir: str, release: Dict) -> int:
-        """并发下载瓦片，返回成功下载数（包含本地已缓存的）。"""
-        downloaded = [0]
+                             temp_dir: str, release: Dict) -> TileBatchStats:
+        """并发下载瓦片，返回可用/缓存数量与失败明细。"""
+        stats = TileBatchStats()
 
         def download_one(x, y, z, save_path):
-            try:
-                content = self.source.fetch_tile(z, x, y, release)
-                if content is not None:
-                    with open(save_path, 'wb') as f:
-                        f.write(content)
-                    downloaded[0] += 1
-                    return
-            except Exception:
-                pass
+            """下载单张瓦片：成功写入文件并返回结果，失败清理半成品后返回结果。"""
+            result = self.source.fetch_tile(z, x, y, release)
+            if result.ok and result.content is not None:
+                with open(save_path, 'wb') as f:
+                    f.write(result.content)
+                return result
             # 失败时清理半成品文件
             if os.path.exists(save_path):
                 try:
                     os.remove(save_path)
                 except OSError:
                     pass
+            return result
 
         tasks = []
         for x, y in tile_coords:
             tile_path = os.path.join(temp_dir, f"tile_{x}_{y}_{zoom}.png")
             if os.path.exists(tile_path) and os.path.getsize(tile_path) > 1000:
-                downloaded[0] += 1
+                stats.cached += 1
+                stats.available += 1
             else:
                 tasks.append((x, y, zoom, tile_path))
 
         if tasks:
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_pool_size) as ex:
-                for i, _ in enumerate(ex.map(lambda t: download_one(*t), tasks), 1):
+                for i, result in enumerate(ex.map(lambda t: download_one(*t), tasks), 1):
+                    if result.ok:
+                        stats.available += 1
+                    else:
+                        stats.failures.append(result)
                     if i % 20 == 0:
                         touch_temp_heartbeat(temp_dir)
         if os.path.isdir(temp_dir):
             touch_temp_heartbeat(temp_dir)
-        return downloaded[0]
+        return stats
 
     # ------------------------------------------------------------------
     # 拼接
@@ -365,11 +365,11 @@ class ImageFetcher:
             if os.path.exists(save_path) and os.path.getsize(save_path) > 1000:
                 pass  # 复用之前探针
             else:
-                content = self.source.fetch_tile(zoom, x, y, release)
-                if content is None:
+                result = self.source.fetch_tile(zoom, x, y, release)
+                if not result.ok or result.content is None:
                     return None
                 with open(save_path, 'wb') as f:
-                    f.write(content)
+                    f.write(result.content)
             with Image.open(save_path) as im:
                 return self.compute_dhash_int(im)
         except Exception:
@@ -461,12 +461,27 @@ class ImageFetcher:
 
         tile_coords = [(x, y) for x in range(x_min, x_max + 1)
                       for y in range(y_min, y_max + 1)]
-        downloaded = self.download_tiles_batch(tile_coords, zoom, temp_dir, date_info)
+        stats = self.download_tiles_batch(tile_coords, zoom, temp_dir, date_info)
 
-        if downloaded == 0:
-            logger.error(f"瓦片下载失败: {date_str}")
+        if stats.available == 0:
+            first_failure = stats.failures[0] if stats.failures else None
+            failure_kind = (
+                first_failure.kind if first_failure else FailureKind.INTERNAL
+            )
+            failure_detail = (
+                first_failure.detail if first_failure else '没有可用瓦片'
+            )
+            logger.error(
+                f"瓦片下载失败: {date_str} ({failure_kind.value}: {failure_detail})"
+            )
             shutil.rmtree(temp_dir, ignore_errors=True)
-            return None
+            return {
+                'status': 'failed',
+                'date': date_str,
+                'failure_kind': failure_kind,
+                'detail': failure_detail,
+                'failures': stats.failures,
+            }
 
         # 精确边界（基于瓦片四角）
         min_lon, min_lat, max_lon, max_lat = self._tile_bounds_wgs84(
@@ -488,11 +503,23 @@ class ImageFetcher:
         except IncompleteTilesError as e:
             logger.error(f"{date_str}: {e}")
             shutil.rmtree(temp_dir, ignore_errors=True)
-            return None
+            return {
+                'status': 'failed',
+                'date': date_str,
+                'failure_kind': FailureKind.INCOMPLETE_TILES,
+                'detail': str(e),
+                'failures': stats.failures,
+            }
 
         if not ok:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            return None
+            return {
+                'status': 'failed',
+                'date': date_str,
+                'failure_kind': FailureKind.INTERNAL,
+                'detail': '拼接失败',
+                'failures': stats.failures,
+            }
 
         # ---------- 1) 整图 MD5 + 感知 dHash 双重去重 ----------
         img_md5 = self.compute_image_hash(temp_png_path)
@@ -512,6 +539,7 @@ class ImageFetcher:
                 'hash': img_md5,
                 'dhash': img_dhash,
                 'date': date_str,
+                'failures': stats.failures,
             }
 
         # ---------- 2) 按用户 buffer 精确裁剪中心矩形（解决低 zoom 单瓦片过大的问题） ----------
@@ -563,6 +591,7 @@ class ImageFetcher:
             self._write_metadata(
                 date_dir, date_info, lat, lon, zoom, buffer_size, bounds,
                 os.path.basename(png_path), os.path.basename(tif_path),
+                failures=stats.failures,
             )
             logger.info(
                 f"成功: {tif_path} "
@@ -573,7 +602,8 @@ class ImageFetcher:
                 'hash': img_md5,
                 'dhash': img_dhash,
                 'date': date_str,
-                'path': tif_path
+                'path': tif_path,
+                'failures': stats.failures,
             }
         else:
             # GeoTIFF 失败（rasterio 不可用），降级为仅输出 PNG
@@ -589,6 +619,7 @@ class ImageFetcher:
             self._write_metadata(
                 date_dir, date_info, lat, lon, zoom, buffer_size, bounds,
                 os.path.basename(png_path), None,
+                failures=stats.failures,
             )
             logger.info(
                 f"成功（仅 PNG）: {png_path} "
@@ -599,18 +630,22 @@ class ImageFetcher:
                 'hash': img_md5,
                 'dhash': img_dhash,
                 'date': date_str,
-                'path': png_path
+                'path': png_path,
+                'failures': stats.failures,
             }
 
     def _write_metadata(self, date_dir: str, release: Dict, lat: float, lon: float,
                         zoom: int, buffer_size: int, bounds: Dict,
-                        png_name: str, tif_name: Optional[str]) -> None:
+                        png_name: str, tif_name: Optional[str],
+                        failures: Optional[List] = None) -> None:
         """在 release 输出目录写入 metadata.json。"""
         metadata = {
             'source': self.info.name,
             'release_id': release.get('id'),
             'release_date': release.get('date'),
             'attribution': release.get('attribution') or self.info.attribution,
+            'metadata_source': release.get('metadata_source', 'native'),
+            'metadata_fetched_at': release.get('metadata_fetched_at', ''),
             'lat': lat,
             'lon': lon,
             'zoom': zoom,
@@ -618,6 +653,7 @@ class ImageFetcher:
             'bounds': bounds,
             'created_at': datetime.now().astimezone().isoformat(timespec='seconds'),
             'files': {'png': png_name, 'tif': tif_name},
+            'diagnostics': self._build_diagnostics(failures or []),
         }
         try:
             with open(os.path.join(date_dir, 'metadata.json'), 'w',
@@ -627,6 +663,35 @@ class ImageFetcher:
             logger.warning(f"写入 metadata.json 失败: {e}")
 
     @staticmethod
+    def _build_diagnostics(failures: List) -> Dict:
+        """把瓦片失败结果汇总为 metadata 中的诊断信息。
+
+        Args:
+            failures: TileResult 列表，kind 可能为 None。
+        Returns:
+            含 by_kind（类型 -> 数量）、failed_tiles（总数）、
+            samples（前 3 条样本）的字典。
+        """
+        by_kind = {}
+        for failure in failures:
+            key = failure.kind.value if failure.kind else 'internal'
+            by_kind[key] = by_kind.get(key, 0) + 1
+        samples = [
+            {
+                'kind': failure.kind.value if failure.kind else 'internal',
+                'http_status': failure.http_status,
+                'url': failure.url,
+                'detail': failure.detail,
+            }
+            for failure in failures[:3]
+        ]
+        return {
+            'by_kind': by_kind,
+            'failed_tiles': len(failures),
+            'samples': samples,
+        }
+
+    @staticmethod
     def _read_metadata_source(date_dir: str) -> str:
         """读取 release 目录的数据源；缺少/损坏 metadata 时按 wayback 处理。"""
         return release._read_metadata_source(date_dir)
@@ -634,11 +699,35 @@ class ImageFetcher:
     # ------------------------------------------------------------------
     # 批量入口
     # ------------------------------------------------------------------
+    def _emit_results(self, results: List[Dict], coord_index=None) -> None:
+        """把结果列表转换为 date_result 事件。
+
+        Args:
+            results: fetch_all 返回的结果列表（含 status/date/name/file_path 等）。
+            coord_index: 批量模式下该坐标点的 1 起始序号；单点模式为 None。
+        Returns:
+            None。逐条通过 events.emit 输出 date_result 事件。
+        """
+        for result in results:
+            kind = result.get('failure_kind')
+            events.emit({
+                'type': 'date_result',
+                'coord_index': coord_index,
+                'date': result.get('date'),
+                'name': result.get('name'),
+                'status': result.get('status'),
+                'kind': kind.value if isinstance(kind, FailureKind) else None,
+                'detail': result.get('detail', ''),
+                'path': result.get('file_path'),
+            })
+
     def fetch_all(self, lat: float, lon: float, zoom: int = 18,
                   output_dir: str = 'data/output/historical',
                   buffer_size: int = 500,
                   date_range: Optional[Tuple[str, str]] = None,
-                  dedup: Optional[bool] = None) -> List[Dict]:
+                  dedup: Optional[bool] = None,
+                  emit_events: bool = False,
+                  event_coord=None) -> List[Dict]:
         logger.info("=" * 60)
         logger.info(
             f"获取坐标 ({lat:.6f}, {lon:.6f}) 的 {self.info.display_name} 影像"
@@ -655,6 +744,39 @@ class ImageFetcher:
         self._downloaded_dhashes.clear()
         self._probe_tile_dhashes.clear()
 
+        try:
+            available = self.get_available_dates(lat, lon, zoom)
+        except ProviderError as e:
+            logger.error(f"获取版本列表失败: {e.detail}")
+            results = [{
+                'date': 'metadata',
+                'name': self.info.display_name,
+                'status': 'failed',
+                'file_path': None,
+                'failure_kind': e.kind,
+                'detail': e.detail,
+                'failures': [],
+            }]
+            if emit_events:
+                self._emit_results(results, event_coord)
+            return results
+
+        dates = release.select_releases(available, date_range)
+        if not dates:
+            logger.warning("没有可用 release")
+            results = [{
+                'date': 'metadata',
+                'name': self.info.display_name,
+                'status': 'failed',
+                'file_path': None,
+                'failure_kind': FailureKind.NO_RELEASES,
+                'detail': '没有可用 release',
+                'failures': [],
+            }]
+            if emit_events:
+                self._emit_results(results, event_coord)
+            return results
+
         # 预筛临时目录：同一坐标点所有 release 共用（1 tile/release，非常小）
         probe_root = os.path.join(
             os.path.abspath(output_dir),
@@ -664,10 +786,6 @@ class ImageFetcher:
             os.makedirs(probe_root, exist_ok=True)
         except Exception:
             probe_root = None  # 建目录失败就放弃预筛，不影响主流程
-
-        dates = release.select_releases(
-            self.get_available_dates(lat, lon, zoom), date_range,
-        )
 
         # 去重代表始终取最早日期：
         # 预填充只纳入「早于本次最早候选日期」且位于请求区间内的同源输出，
@@ -759,6 +877,16 @@ class ImageFetcher:
                     'status': 'failed',
                     'file_path': None,
                 })
+            elif result['status'] == 'failed':
+                results.append({
+                    'date': date_str,
+                    'name': date_info.get('name', date_str),
+                    'status': 'failed',
+                    'file_path': None,
+                    'failure_kind': result['failure_kind'],
+                    'detail': result['detail'],
+                    'failures': result['failures'],
+                })
             elif result['status'] == 'duplicate':
                 skipped_duplicates += 1
                 results.append({
@@ -806,6 +934,13 @@ class ImageFetcher:
 
         success = sum(1 for r in results if r['status'] == 'success')
         failed = sum(1 for r in results if r['status'] == 'failed')
+        all_failures = []
+        for r in results:
+            all_failures.extend(r.get('failures') or [])
+        failure_counts = {}
+        for failure in all_failures:
+            key = failure.kind.value if failure.kind else 'internal'
+            failure_counts[key] = failure_counts.get(key, 0) + 1
 
         logger.info(f"\n完成！成功 {success}/{len(results)} 个")
         if skipped_existing > 0:
@@ -814,6 +949,15 @@ class ImageFetcher:
             logger.info(f"跳过重复图片: {skipped_duplicates} 个")
         if failed > 0:
             logger.info(f"下载失败: {failed} 个")
+        if failure_counts:
+            logger.info(
+                "失败分类: " + ", ".join(
+                    f"{k}={v}" for k, v in sorted(failure_counts.items())
+                )
+            )
+
+        if emit_events:
+            self._emit_results(results, event_coord)
 
         return results
 
@@ -826,7 +970,8 @@ class ImageFetcher:
                     buffer_size: int = 500,
                     date_range: Optional[Tuple[str, str]] = None,
                     coord_concurrency: int = 1,
-                    dedup: Optional[bool] = None) -> List[Dict]:
+                    dedup: Optional[bool] = None,
+                    emit_events: bool = False) -> List[Dict]:
         """批量获取多坐标点的影像。
 
         Args:
@@ -895,6 +1040,8 @@ class ImageFetcher:
                     buffer_size=buffer_size,
                     date_range=date_range,
                     dedup=effective_dedup,
+                    emit_events=emit_events,
+                    event_coord=index,
                 )
             except ValueError as e:
                 logger.error(f"[{i}/{total}] {sub} 坐标越界: {e}")

@@ -11,8 +11,26 @@ from typing import List
 
 import tkinter as tk
 
+from core.events import parse as parse_event
 from ui import BASE_DIR
 from ui.theme import HAS_TTKBOOTSTRAP, SUCCESS
+
+FAILURE_LABELS = {
+    'no_releases': '无可用版本',
+    'out_of_range': '范围越界',
+    'network': '网络错误',
+    'timeout': '请求超时',
+    'tls': 'TLS 证书错误',
+    'http_error': 'HTTP 错误',
+    'forbidden': '访问被拒绝 (403)',
+    'rate_limited': '请求过多 (429)',
+    'server': '服务端错误 (5xx)',
+    'blocked': '服务商拦截',
+    'invalid_content': '响应内容无效',
+    'incomplete_tiles': '瓦片不完整',
+    'interface_changed': '外部接口已变更',
+    'internal': '内部错误',
+}
 
 
 def _build_cli_cmd(extra_args: List[str]) -> List[str]:
@@ -23,8 +41,8 @@ def _build_cli_cmd(extra_args: List[str]) -> List[str]:
             sys.executable 即 exe 自身，不再拼接脚本路径）
     """
     if getattr(sys, 'frozen', False):
-        return [sys.executable] + list(extra_args)
-    return [sys.executable, os.path.join(BASE_DIR, 'main.py')] + list(extra_args)
+        return [sys.executable, '--events'] + list(extra_args)
+    return [sys.executable, os.path.join(BASE_DIR, 'main.py'), '--events'] + list(extra_args)
 
 
 def _cli_workdir() -> str:
@@ -48,6 +66,10 @@ class RunnerMixin:
         try:
             while True:
                 msg = self.log_queue.get_nowait()
+                evt = parse_event(msg)
+                if evt is not None:
+                    self._handle_event(evt)
+                    continue
                 self.log.insert(tk.END, msg + '\n')
                 self._colorize_last_log_line(msg)
                 if self.auto_scroll_var.get():
@@ -121,14 +143,48 @@ class RunnerMixin:
         except Exception:
             pass
 
+    def _handle_event(self, event: dict):
+        """把一条 TG_EVENT 结构化事件渲染到结果 Treeview。
+
+        Args:
+            event: core.events.parse 解析出的字典。
+        Returns:
+            None。仅 date_result 事件插入结果行，其余事件忽略。
+        """
+        if event.get('type') != 'date_result':
+            return
+        status_map = {
+            'success':   ('✅ success', 'row_success'),
+            'failed':    ('❌ failed',  'row_failed'),
+            'duplicate': ('♻️ duplicate', 'row_partial'),
+            'existing':  ('📁 existing',  'row_partial'),
+        }
+        status = event.get('status')
+        status_txt, row_tag = status_map.get(status, (status, ''))
+        if event.get('coord_index') is not None:
+            label = event.get('name') or event.get('date')
+        else:
+            label = event.get('date')
+        reason = FAILURE_LABELS.get(event.get('kind') or '', '')
+        if not reason:
+            reason = event.get('detail') or ''
+        path = event.get('path') or ''
+        self.result_tree.insert('', tk.END,
+            values=(label, status_txt, reason, path),
+            tags=(row_tag,))
+        self._update_progress_fine()
+
     def _update_progress_fine(self):
-        """从 result_tree 已插入的 [OK]/[FAIL] 计数估算总进度。"""
+        """从 result_tree 已插入的结果行计数估算总进度。"""
         try:
             rows = self.result_tree.get_children()
             done = 0
             for r in rows:
                 vals = self.result_tree.item(r, 'values')
-                if len(vals) > 1 and vals[1] in ("✅ success", "⚠️ partial", "❌ failed"):
+                if len(vals) > 1 and vals[1] in (
+                    "✅ success", "⚠️ partial", "❌ failed",
+                    "♻️ duplicate", "📁 existing",
+                ):
                     done += 1
             if done > 0 and self._estimated_total_dates and self._estimated_total_dates > 0:
                 est = min(done / self._estimated_total_dates, 0.99)
@@ -138,22 +194,7 @@ class RunnerMixin:
             pass
 
     def _parse_result_line(self, msg: str):
-        """解析单点/批量结果日志，填充结果 Treeview。"""
-        # 单点模式：[OK] 2024-08-15
-        m1 = re.search(r'\[OK\]\s+(\S+)', msg)
-        if m1:
-            self.result_tree.insert('', tk.END,
-                values=(m1.group(1), '✅ success', ''),
-                tags=('row_success',))
-            self._update_progress_fine()
-            return
-        m2 = re.search(r'\[FAIL\]\s+(\S+)', msg)
-        if m2:
-            self.result_tree.insert('', tk.END,
-                values=(m2.group(1), '❌ failed', ''),
-                tags=('row_failed',))
-            self._update_progress_fine()
-            return
+        """解析单点/批量结果日志，填充结果 Treeview（旧日志回退）。"""
         # 批量模式：[OK] name (lat, lon) 成功 X/Y
         m3 = re.search(r'\[(OK|PART|FAIL)\]\s+(\S+)\s+\(([0-9.\-]+),\s*([0-9.\-]+)\)\s+成功\s+(\d+)/(\d+)', msg)
         if m3:
@@ -165,8 +206,23 @@ class RunnerMixin:
             }
             status_txt, row_tag = status_map.get(tag, (tag, ''))
             self.result_tree.insert('', tk.END, values=(
-                name, status_txt, f"{lat},{lon} 成功 {succ}/{total}"
+                name, status_txt, '', f"{lat},{lon} 成功 {succ}/{total}"
             ), tags=(row_tag,))
+            self._update_progress_fine()
+            return
+        # 单点模式：[OK] 2024-08-15
+        m1 = re.search(r'\[OK\]\s+(\S+)', msg)
+        if m1:
+            self.result_tree.insert('', tk.END,
+                values=(m1.group(1), '✅ success', '', ''),
+                tags=('row_success',))
+            self._update_progress_fine()
+            return
+        m2 = re.search(r'\[FAIL\]\s+(\S+)', msg)
+        if m2:
+            self.result_tree.insert('', tk.END,
+                values=(m2.group(1), '❌ failed', '', ''),
+                tags=('row_failed',))
             self._update_progress_fine()
 
     # ------------------------------------------------------------------
@@ -252,7 +308,7 @@ class RunnerMixin:
         if not iid:
             return
         vals = self.result_tree.item(iid, 'values')
-        path = vals[2] if len(vals) > 2 else ''
+        path = vals[3] if len(vals) > 3 else ''
         # 路径可能只是 "lat,lon 成功 X/Y"，无目录则忽略
         if path and os.path.exists(path):
             self._open_in_file_manager(os.path.dirname(path))

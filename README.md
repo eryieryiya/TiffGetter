@@ -33,6 +33,7 @@
 - 不支持历史版本的数据源只返回一个 `current` 版本，输出目录为 `current/`。
 - 请求的缩放级别超过数据源上限时会自动截断到上限并给出警告。
 - 未注册的 `--source` 以退出码 2 结束，并列出可选数据源。
+- Wayback 元数据缓存路径为 `data/cache/wayback_releases.json`，有效期 24 小时；在线元数据不可用时回退内置列表，并在 `metadata.json` 中标记为 `fallback`。
 
 ## 能力边界
 
@@ -146,7 +147,7 @@ New York,liberty,40.6892,-74.0445
 # 单点：输出到宿主机 ./out
 docker run --rm \
   -v "$PWD/out:/app/data/output" \
-  ghcr.io/eryieryiya/tiffgetter:v0.1.2 \
+  ghcr.io/eryieryiya/tiffgetter:v0.1.3 \
   --source esri --lat 35.6586 --lon 139.7454 --zoom 15 --buffer 300
 
 # 批量：挂载坐标文件
@@ -215,6 +216,7 @@ python ui_main.py
 | `--date-range` | 日期范围筛选（起始 截止，仅支持历史的数据源） | 全部 |
 | `--coord-concurrency` | 批量模式下坐标并发数 (1-16，实际并行处理) | 1 |
 | `--no-dedup` | 关闭重复检测，每个历史日期都单独输出 | 关闭（默认去重） |
+| `--events` | 输出 TG_EVENT 结构化事件（供 GUI/自动化消费） | 关闭 |
 
 ### 单点模式（与 `--coords-file` 互斥）
 
@@ -312,6 +314,39 @@ data/output/esri/                     # 非历史源
 - 同一视觉组保留**最早日期**：按日期升序遍历，先下载的日期保留，后续相同影像标记为 `duplicate`。
 - 指定 `--date-range` 时，去重只与区间内的已有输出比较，区间外的旧影像不会让区间内更早的日期被跳过；结束时打印 `[区间校验] 区间内最早保留影像日期: ...`，区间内没有影像时给出告警。
 - 需要保留下载到的每个历史日期时，加 `--no-dedup`：跳过中心瓦片预筛与整图去重，即使影像视觉相同也各写一个日期目录。
+
+## 错误诊断与退出码
+
+### 退出码
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 全部成功 |
+| `2` | 参数 / 坐标文件 / 数据源错误 |
+| `3` | 部分日期失败 |
+| `4` | 全部日期失败（含无可用 release） |
+| `5` | 全部失败且均为外部接口变更 |
+
+### 失败类型
+
+瓦片与元数据错误按统一分类标记，`--events` 事件与 `metadata.json` 使用同一套标识：
+
+| 类型 | 说明 |
+|---|---|
+| `forbidden` | 访问被拒绝 (403) |
+| `rate_limited` | 请求过多 (429) |
+| `timeout` | 请求超时 |
+| `tls` | TLS 证书错误 |
+| `blocked` | 服务商拦截 |
+| `invalid_content` | 响应内容无效 |
+| `incomplete_tiles` | 瓦片不完整 |
+| `interface_changed` | 外部接口已变更 |
+
+### metadata.json 诊断字段
+
+- `diagnostics`：包含 `by_kind`（失败类型 → 数量）、`failed_tiles`（失败瓦片总数）、`samples`（前 3 条失败样本，含 `kind`、`http_status`、`url`、`detail`）。
+- `metadata_source`：元数据来源，取值为 `online`（在线拉取）、`cache`（24 小时磁盘缓存）、`fallback`（在线不可用时回退内置列表）、`native`（数据源原生元数据）。
+- `metadata_fetched_at`：元数据获取时间（ISO 8601）。
 
 ## 版权与使用限制
 

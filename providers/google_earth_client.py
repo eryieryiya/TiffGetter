@@ -8,8 +8,10 @@ import threading
 from typing import List, Dict, Tuple, Optional
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('TiffGetter')
 
+
+PROTOCOL_VERSION = 'ge-timemachine-v1'
 
 PACKET_MAGIC = 0x7468dead
 PACKET_MAGIC_SWAP = 0xadde6874
@@ -589,6 +591,7 @@ class GoogleEarthClient:
         self._lock = threading.Lock()
         self._dates_cache: Dict[str, List[Dict]] = {}
         self._fallback_cache: Dict[Tuple[str, str], Dict] = {}
+        self.last_error: Optional[BaseException] = None
     
     def initialize(self) -> bool:
         """初始化Google Earth客户端，获取加密密钥和数据库版本
@@ -601,22 +604,28 @@ class GoogleEarthClient:
                 return True
             
             try:
-                print("正在初始化Google Earth TimeMachine数据库...")
+                logger.info("正在初始化Google Earth TimeMachine数据库...")
                 resp = self.session.get(DB_ROOT_URL, timeout=self.timeout)
                 
                 if resp.status_code != 200:
-                    print(f"获取dbRoot失败: HTTP {resp.status_code}")
+                    message = f"获取dbRoot失败: HTTP {resp.status_code}"
+                    logger.error(message)
+                    self.last_error = RuntimeError(message)
                     return False
                 
                 encrypted_data = resp.content
                 
                 if len(encrypted_data) < 100:
-                    print("dbRoot数据过短")
+                    message = "dbRoot数据过短"
+                    logger.error(message)
+                    self.last_error = RuntimeError(message)
                     return False
                 
                 encryption_data = self._extract_encryption_key(encrypted_data)
                 if encryption_data is None:
-                    print("无法提取加密密钥")
+                    message = "无法提取加密密钥"
+                    logger.error(message)
+                    self.last_error = RuntimeError(message)
                     return False
                 
                 self._encryption_key = encryption_data
@@ -624,17 +633,19 @@ class GoogleEarthClient:
                 db_root_data = self._extract_db_root(encrypted_data)
                 if db_root_data:
                     self._db_version = self._extract_db_version(db_root_data)
-                    print(f"Google Earth数据库版本: {self._db_version}")
+                    logger.info(f"Google Earth数据库版本: {self._db_version}")
                 else:
                     self._db_version = 1031
-                    print(f"使用默认数据库版本: {self._db_version}")
+                    logger.warning(f"使用默认数据库版本: {self._db_version}")
                 
                 self._initialized = True
-                print("Google Earth客户端初始化成功")
+                logger.info("Google Earth客户端初始化成功")
+                logger.info(f"Google Earth 协议版本: {PROTOCOL_VERSION}")
                 return True
                 
             except Exception as e:
-                print(f"初始化Google Earth客户端失败: {e}")
+                logger.error(f"初始化Google Earth客户端失败: {e}")
+                self.last_error = e
                 return False
     
     def _extract_encryption_key(self, data: bytes) -> Optional[bytes]:

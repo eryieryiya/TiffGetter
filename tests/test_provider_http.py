@@ -8,6 +8,7 @@ import logging
 
 import pytest
 
+from core.errors import FailureKind
 from providers.registry import get_source
 
 
@@ -53,7 +54,8 @@ def test_fetch_image_returns_bytes_for_valid_png():
 
     result = source._fetch_image("https://example.invalid/1/2/3.png")
 
-    assert result == PNG_BYTES
+    assert result.ok is True
+    assert result.content == PNG_BYTES
     assert len(source.session.calls) == 1
     call = source.session.calls[0]
     assert call["url"] == "https://example.invalid/1/2/3.png"
@@ -61,7 +63,7 @@ def test_fetch_image_returns_bytes_for_valid_png():
     assert "User-Agent" in call["headers"]
 
 
-def test_fetch_image_x_blocked_returns_none_and_logs_once(caplog):
+def test_fetch_image_x_blocked_returns_failure_and_logs_once(caplog):
     caplog.set_level(logging.ERROR, logger="providers.xyz")
     blocked = FakeResponse(
         200,
@@ -70,8 +72,13 @@ def test_fetch_image_x_blocked_returns_none_and_logs_once(caplog):
     )
     source = _osm_source_with(blocked, blocked)
 
-    assert source._fetch_image("https://example.invalid/tile.png") is None
-    assert source._fetch_image("https://example.invalid/tile.png") is None
+    first = source._fetch_image("https://example.invalid/tile.png")
+    second = source._fetch_image("https://example.invalid/tile.png")
+
+    assert not first.ok
+    assert first.kind is FailureKind.BLOCKED
+    assert not second.ok
+    assert second.kind is FailureKind.BLOCKED
 
     records = [
         r for r in caplog.records
@@ -82,29 +89,39 @@ def test_fetch_image_x_blocked_returns_none_and_logs_once(caplog):
     assert len(source.session.calls) == 2
 
 
-def test_fetch_image_403_returns_none():
+def test_fetch_image_403_returns_forbidden():
     source = _osm_source_with(
         FakeResponse(403, {"Content-Type": "text/plain"}, b"forbidden"),
     )
 
-    assert source._fetch_image("https://example.invalid/tile.png") is None
+    result = source._fetch_image("https://example.invalid/tile.png")
+
+    assert not result.ok
+    assert result.kind is FailureKind.FORBIDDEN
+    assert result.http_status == 403
 
 
-def test_fetch_image_html_content_type_returns_none():
+def test_fetch_image_html_content_type_returns_invalid_content():
     source = _osm_source_with(
         FakeResponse(200, {"Content-Type": "text/html; charset=utf-8"},
                      b"<html>blocked</html>" * 10),
     )
 
-    assert source._fetch_image("https://example.invalid/tile.png") is None
+    result = source._fetch_image("https://example.invalid/tile.png")
+
+    assert not result.ok
+    assert result.kind is FailureKind.INVALID_CONTENT
 
 
-def test_fetch_image_too_short_content_returns_none():
+def test_fetch_image_too_short_content_returns_invalid_content():
     source = _osm_source_with(
         FakeResponse(200, {"Content-Type": "image/png"}, b"\x89PNG"),
     )
 
-    assert source._fetch_image("https://example.invalid/tile.png") is None
+    result = source._fetch_image("https://example.invalid/tile.png")
+
+    assert not result.ok
+    assert result.kind is FailureKind.INVALID_CONTENT
 
 
 # ----------------------------------------------------------------------

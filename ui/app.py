@@ -233,16 +233,18 @@ class App(ThemeMixin, RunnerMixin, MapPickerMixin,
         # ---------- 结果 Treeview ----------
         result_frame = ttk.LabelFrame(self.root, text="结果", padding=4)
         result_frame.pack(fill=tk.X, padx=8, pady=(8, 0))
-        cols = ("date", "status", "path")
+        cols = ("date", "status", "reason", "path")
         self.result_tree = ttk.Treeview(
             result_frame, columns=cols, show='headings', height=5
         )
         self.result_tree.heading("date", text="日期 / 名称")
         self.result_tree.heading("status", text="状态")
+        self.result_tree.heading("reason", text="失败原因")
         self.result_tree.heading("path", text="路径")
-        self.result_tree.column("date", width=160, anchor=tk.W)
+        self.result_tree.column("date", width=150, anchor=tk.W)
         self.result_tree.column("status", width=100, anchor=tk.CENTER)
-        self.result_tree.column("path", width=400, anchor=tk.W)
+        self.result_tree.column("reason", width=150, anchor=tk.W)
+        self.result_tree.column("path", width=320, anchor=tk.W)
         self.result_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
         rsb = ttk.Scrollbar(result_frame, command=self.result_tree.yview)
         rsb.pack(side=tk.RIGHT, fill=tk.Y)

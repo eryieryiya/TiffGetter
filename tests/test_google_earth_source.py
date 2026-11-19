@@ -1,8 +1,10 @@
 """Google Earth 数据源适配器的离线单元测试（不触发网络初始化）。"""
 
 import pytest
+import requests
 from PIL import Image
 
+from core.errors import FailureKind, ProviderError
 from providers.base import SourceInfo
 from providers.google_earth import GoogleEarthSource
 from providers.google_earth_client import quadtree_path_bounds
@@ -245,3 +247,66 @@ def test_to_release_strips_whitespace_and_coerces_epoch(source):
 )
 def test_to_release_returns_none_for_incomplete_item(source, item):
     assert source._to_release(item, 8) is None
+
+
+# ---------------------------------------------------------------------------
+# 协议错误分类
+# ---------------------------------------------------------------------------
+def test_client_init_failure_raises_interface_changed(monkeypatch):
+    class FakeClient:
+        def __init__(self, timeout=30):
+            self.last_error = RuntimeError("dbRoot 失败")
+
+        def initialize(self):
+            return False
+
+    monkeypatch.setattr("providers.google_earth.GoogleEarthClient", FakeClient)
+    source = GoogleEarthSource(get_source("google").info)
+
+    with pytest.raises(ProviderError) as excinfo:
+        source.available_releases(0, 0, 10)
+
+    assert excinfo.value.kind == FailureKind.INTERFACE_CHANGED
+    assert "dbRoot 失败" in excinfo.value.detail
+
+
+def test_client_parse_error_raises_interface_changed(monkeypatch):
+    class FakeClient:
+        def __init__(self, timeout=30):
+            self.last_error = None
+
+        def initialize(self):
+            return True
+
+        def get_dates_for_path(self, path):
+            raise ValueError("packet parse failed")
+
+    monkeypatch.setattr("providers.google_earth.GoogleEarthClient", FakeClient)
+    source = GoogleEarthSource(get_source("google").info)
+
+    with pytest.raises(ProviderError) as excinfo:
+        source.available_releases(0, 0, 10)
+
+    assert excinfo.value.kind == FailureKind.INTERFACE_CHANGED
+    assert "packet parse failed" in excinfo.value.detail
+
+
+def test_client_network_error_raises_timeout(monkeypatch):
+    class FakeClient:
+        def __init__(self, timeout=30):
+            self.last_error = None
+
+        def initialize(self):
+            return True
+
+        def get_dates_for_path(self, path):
+            raise requests.exceptions.Timeout("read timeout")
+
+    monkeypatch.setattr("providers.google_earth.GoogleEarthClient", FakeClient)
+    source = GoogleEarthSource(get_source("google").info)
+
+    with pytest.raises(ProviderError) as excinfo:
+        source.available_releases(0, 0, 10)
+
+    assert excinfo.value.kind == FailureKind.TIMEOUT
+    assert "read timeout" in excinfo.value.detail

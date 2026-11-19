@@ -1,7 +1,9 @@
 """基于 URL 模板的 XYZ 瓦片数据源。"""
 import logging
 from abc import abstractmethod
-from typing import Dict, Optional
+from typing import Dict
+
+from core.errors import FailureKind, TileResult, classify_exception
 
 from .base import TileSource
 
@@ -26,8 +28,8 @@ class XYZSource(TileSource):
     def build_url(self, z: int, x: int, y: int, release: Dict) -> str:
         """构造瓦片 URL，由子类实现。"""
 
-    def _fetch_image(self, url: str) -> Optional[bytes]:
-        """请求并校验单张瓦片；任何失败返回 None。"""
+    def _fetch_image(self, url: str) -> TileResult:
+        """请求并校验单张瓦片，返回结构化的 TileResult。"""
         try:
             resp = self.session.get(url, headers=self.headers(), timeout=60)
             if resp.status_code != 200:
@@ -43,7 +45,20 @@ class XYZSource(TileSource):
                         logger.warning(
                             f"瓦片请求返回 HTTP {resp.status_code}: {url}"
                         )
-                return None
+                if resp.status_code in (401, 403):
+                    kind = FailureKind.FORBIDDEN
+                elif resp.status_code == 429:
+                    kind = FailureKind.RATE_LIMITED
+                elif resp.status_code >= 500:
+                    kind = FailureKind.SERVER
+                else:
+                    kind = FailureKind.HTTP_ERROR
+                return TileResult.failure(
+                    kind,
+                    detail=f"HTTP {resp.status_code}",
+                    url=url,
+                    http_status=resp.status_code,
+                )
             # OSM 拦截时可能用 HTTP 200 返回“Access blocked”图片，
             # 只能通过 X-Blocked 响应头识别。
             blocked = resp.headers.get('X-Blocked')
@@ -54,18 +69,36 @@ class XYZSource(TileSource):
                         f"瓦片服务返回拦截页 (X-Blocked): {blocked}。"
                         "请降低请求频率、等待解封，或改用其它数据源。"
                     )
-                return None
+                return TileResult.failure(
+                    FailureKind.BLOCKED,
+                    detail=f"X-Blocked: {blocked}",
+                    url=url,
+                    http_status=resp.status_code,
+                )
             content_type = resp.headers.get('Content-Type', '')
             if not content_type.lower().startswith('image/'):
-                return None
+                return TileResult.failure(
+                    FailureKind.INVALID_CONTENT,
+                    detail=f"Content-Type: {content_type}",
+                    url=url,
+                    http_status=resp.status_code,
+                )
             if len(resp.content) <= 100:
-                return None
-            return resp.content
-        except Exception:
-            return None
+                return TileResult.failure(
+                    FailureKind.INVALID_CONTENT,
+                    detail=f"内容长度 {len(resp.content)} 字节",
+                    url=url,
+                    http_status=resp.status_code,
+                )
+            return TileResult.success(resp.content, url)
+        except Exception as e:
+            kind = classify_exception(e)
+            return TileResult.failure(
+                kind, detail=f"{type(e).__name__}: {e}", url=url,
+            )
 
-    def fetch_tile(self, z: int, x: int, y: int, release: Dict) -> Optional[bytes]:
+    def fetch_tile(self, z: int, x: int, y: int, release: Dict) -> TileResult:
         url = self.build_url(z, x, y, release)
         if not url:
-            return None
+            return TileResult.failure(FailureKind.INTERNAL, '空瓦片 URL')
         return self._fetch_image(url)

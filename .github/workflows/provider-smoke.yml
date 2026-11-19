@@ -1,0 +1,40 @@
+name: Provider Smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: esri
+            extra: ""
+          - source: bing
+            extra: ""
+          - source: osm
+            extra: ""
+          - source: wayback
+            extra: "--date-range 2026-01-01 2026-12-31"
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime dependencies
+        run: python -m pip install -r requirements-runtime.txt
+
+      - name: Run provider smoke
+        run: |
+          python main.py --source ${{ matrix.source }} --lat 35.6586 --lon 139.7454 --zoom 18 --buffer 50 --output "${{ runner.temp }}/smoke-${{ matrix.source }}" --events ${{ matrix.extra }}

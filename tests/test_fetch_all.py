@@ -17,6 +17,7 @@ from PIL import Image
 
 import satellite_processor
 import utils.cleanup as cleanup_utils
+from core.errors import FailureKind, TileBatchStats, TileResult
 from providers.base import SourceInfo, TileSource
 from satellite_processor import ImageFetcher
 
@@ -53,7 +54,7 @@ class FakeSource(TileSource):
         ]
 
     def fetch_tile(self, z, x, y, release):
-        return None
+        return TileResult.success(b"fake-tile")
 
 
 @pytest.fixture
@@ -76,7 +77,7 @@ def make_fetcher(fetcher_factory, monkeypatch, tmp_path):
     # GeoTIFF 输出与本测试无关，降级为仅 PNG（避免依赖 rasterio 写文件）
     monkeypatch.setattr(ImageFetcher, "png_to_geotiff", lambda *a, **k: False)
 
-    def _make(dates, dedup=True):
+    def _make(dates, dedup=True, fake_tiles=True):
         fetcher = fetcher_factory(dedup=dedup)
         fake = FakeSource(dates)
         fetcher.source = fake
@@ -90,9 +91,10 @@ def make_fetcher(fetcher_factory, monkeypatch, tmp_path):
                     os.path.join(temp_dir, f"tile_{x}_{y}_{zoom}.png"),
                     format="PNG",
                 )
-            return len(tile_coords)
+            return TileBatchStats(available=len(tile_coords))
 
-        fetcher.download_tiles_batch = _fake_download
+        if fake_tiles:
+            fetcher.download_tiles_batch = _fake_download
         return fetcher
 
     return _make
@@ -168,3 +170,107 @@ def test_fetch_all_dedup_disabled_outputs_every_date(tmp_path, make_fetcher):
     for d in dates:
         assert (out / d / f"{d}.png").exists()
         assert (out / d / "metadata.json").exists()
+
+
+def test_fetch_all_no_releases_returns_no_releases(tmp_path, make_fetcher):
+    """数据源没有任何 release 时返回单条 NO_RELEASES 失败结果。"""
+    fetcher = make_fetcher([])
+    out = tmp_path / "out"
+
+    results = fetcher.fetch_all(LAT, LON, ZOOM, str(out), buffer_size=500)
+
+    assert len(results) == 1
+    assert results[0]["date"] == "metadata"
+    assert results[0]["status"] == "failed"
+    assert results[0]["failure_kind"] == FailureKind.NO_RELEASES
+    assert results[0]["detail"] == "没有可用 release"
+    assert not out.exists()
+
+
+def test_fetch_all_all_tiles_failed_returns_failure_kind(
+    tmp_path, make_fetcher, monkeypatch
+):
+    """所有瓦片下载失败时结果携带具体失败类型，且不生成日期目录。"""
+    fetcher = make_fetcher(["2015-06-01"], fake_tiles=False)
+    monkeypatch.setattr(
+        fetcher.source,
+        "fetch_tile",
+        lambda z, x, y, release: TileResult.failure(
+            FailureKind.FORBIDDEN, "HTTP 403", http_status=403
+        ),
+    )
+    out = tmp_path / "out"
+
+    results = fetcher.fetch_all(LAT, LON, ZOOM, str(out), buffer_size=500)
+
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["failure_kind"] == FailureKind.FORBIDDEN
+    assert results[0]["detail"] == "HTTP 403"
+    assert not (out / "2015-06-01").exists()
+
+
+def test_write_metadata_includes_diagnostics(tmp_path, fetcher_factory):
+    """metadata.json 汇总失败类型计数与样本。"""
+    fetcher = fetcher_factory()
+    fake = FakeSource(["2015-06-01"])
+    release_info = fake.available_releases(LAT, LON, ZOOM)[0]
+    date_dir = tmp_path / "2015-06-01"
+    date_dir.mkdir()
+    bounds = {
+        "min_lon": 121.4,
+        "min_lat": 31.2,
+        "max_lon": 121.5,
+        "max_lat": 31.3,
+    }
+    failures = [
+        TileResult.failure(
+            FailureKind.FORBIDDEN,
+            "HTTP 403",
+            url="https://example.invalid/a.png",
+            http_status=403,
+        ),
+        TileResult.failure(
+            FailureKind.TIMEOUT,
+            "read timeout",
+            url="https://example.invalid/b.png",
+        ),
+    ]
+
+    fetcher._write_metadata(
+        str(date_dir), release_info, LAT, LON, ZOOM, 500, bounds,
+        "2015-06-01.png", None, failures=failures,
+    )
+
+    meta = json.loads((date_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["metadata_source"] == "native"
+    assert meta["diagnostics"]["failed_tiles"] == 2
+    assert meta["diagnostics"]["by_kind"] == {"forbidden": 1, "timeout": 1}
+    assert len(meta["diagnostics"]["samples"]) == 2
+
+
+def test_download_tiles_batch_returns_stats(tmp_path, fetcher_factory, monkeypatch):
+    """download_tiles_batch 统计可用瓦片并收集失败明细。"""
+    fetcher = fetcher_factory()
+    fake = FakeSource(["2015-06-01"])
+    fetcher.source = fake
+    fetcher.info = fake.info
+    fetcher.thread_pool_size = 1
+
+    def _fetch(z, x, y, release):
+        if x == 100:
+            return TileResult.success(b"fake-tile-ok")
+        return TileResult.failure(FailureKind.TIMEOUT, "read timeout")
+
+    monkeypatch.setattr(fake, "fetch_tile", _fetch)
+    temp_dir = tmp_path / "tiles"
+    temp_dir.mkdir()
+
+    stats = fetcher.download_tiles_batch(
+        [(100, 200), (101, 200)], ZOOM, str(temp_dir),
+        {"id": "rel-2015-06-01", "date": "2015-06-01"},
+    )
+
+    assert stats.available == 1
+    assert len(stats.failures) == 1
+    assert stats.failures[0].kind == FailureKind.TIMEOUT

@@ -7,6 +7,14 @@ import tempfile
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
+import requests
+
+from core.errors import (
+    FailureKind,
+    ProviderError,
+    TileResult,
+    classify_exception,
+)
 
 from .base import TileSource
 from .google_earth_client import (
@@ -36,6 +44,7 @@ class GoogleEarthSource(TileSource):
         super().__init__(info)
         self._client: Optional[GoogleEarthClient] = None
         self._init_attempted = False
+        self._client_error: Optional[BaseException] = None
 
     # ------------------------------------------------------------------
     # 客户端懒加载
@@ -49,11 +58,13 @@ class GoogleEarthSource(TileSource):
         try:
             client = GoogleEarthClient(timeout=self._CLIENT_TIMEOUT)
             if not client.initialize():
+                self._client_error = client.last_error
                 logger.warning("Google Earth 客户端初始化失败，该数据源暂不可用")
                 self._client = None
                 return None
             self._client = client
         except Exception as e:
+            self._client_error = e
             logger.warning(f"Google Earth 客户端初始化异常: {e}")
             self._client = None
         return self._client
@@ -73,20 +84,32 @@ class GoogleEarthSource(TileSource):
 
         client = self._ensure_client()
         if client is None:
-            return []
+            raise ProviderError(
+                FailureKind.INTERFACE_CHANGED,
+                f'Google Earth 客户端不可用: '
+                f'{self._client_error or "initialize failed"}',
+            )
 
         dates: List[Dict] = []
         data_level = 0
+        last_error: Optional[BaseException] = None
         for level in self._candidate_levels(zoom):
             path = lat_lon_to_quadtree_path(lat, lon, level)
             try:
                 dates = client.get_dates_for_path(path)
             except Exception as e:
+                last_error = e
                 logger.warning(f"Google Earth 历史日期查询失败 (level={level}): {e}")
                 dates = []
             if dates:
                 data_level = level
                 break
+
+        if not dates and last_error is not None:
+            detail = f'{type(last_error).__name__}: {last_error}'
+            if isinstance(last_error, requests.exceptions.RequestException):
+                raise ProviderError(classify_exception(last_error), detail)
+            raise ProviderError(FailureKind.INTERFACE_CHANGED, detail)
 
         if not dates:
             logger.warning("Google Earth 该位置没有可用历史日期")
@@ -171,18 +194,25 @@ class GoogleEarthSource(TileSource):
     # ------------------------------------------------------------------
     # 瓦片下载
     # ------------------------------------------------------------------
-    def fetch_tile(self, z: int, x: int, y: int, release: Dict) -> Optional[bytes]:
+    def fetch_tile(self, z: int, x: int, y: int, release: Dict) -> TileResult:
         try:
             client = self._ensure_client()
             if client is None:
-                return None
+                return TileResult.failure(
+                    FailureKind.INTERFACE_CHANGED,
+                    f'Google Earth 客户端不可用: '
+                    f'{self._client_error or "initialize failed"}',
+                )
 
             ge_level = int(release.get('ge_level') or min(z, self._MAX_DATA_LEVEL))
             date_str = None if release.get('is_current') else release.get('date')
             dst_bounds = self._xyz_tile_bounds(z, x, y)
             paths = self._covering_paths(*dst_bounds, ge_level)
             if not paths:
-                return None
+                return TileResult.failure(
+                    FailureKind.INTERNAL,
+                    '没有覆盖目标范围的 Google Earth 瓦片',
+                )
 
             canvas = Image.new('RGB', (256, 256), (0, 0, 0))
             fetched = 0
@@ -194,7 +224,10 @@ class GoogleEarthSource(TileSource):
                         logger.debug(
                             f"Google Earth 瓦片不可用 {path} date={date_str or 'latest'}"
                         )
-                        return None
+                        return TileResult.failure(
+                            FailureKind.NETWORK,
+                            f'Google Earth 瓦片不可用: {path}',
+                        )
                     with Image.open(tmp_path) as img:
                         self._paste(
                             canvas,
@@ -210,14 +243,20 @@ class GoogleEarthSource(TileSource):
                         pass
 
             if fetched == 0:
-                return None
+                return TileResult.failure(
+                    FailureKind.INTERNAL,
+                    '没有覆盖目标范围的 Google Earth 瓦片',
+                )
 
             buffer = io.BytesIO()
             canvas.save(buffer, format='PNG')
-            return buffer.getvalue()
+            return TileResult.success(buffer.getvalue())
         except Exception as e:
             logger.warning(f"Google Earth 瓦片处理失败 ({z}/{x}/{y}): {e}")
-            return None
+            detail = f'{type(e).__name__}: {e}'
+            if isinstance(e, requests.exceptions.RequestException):
+                return TileResult.failure(classify_exception(e), detail)
+            return TileResult.failure(FailureKind.INTERFACE_CHANGED, detail)
 
     @staticmethod
     def _xyz_tile_bounds(z: int, x: int, y: int) -> Tuple[float, float, float, float]:

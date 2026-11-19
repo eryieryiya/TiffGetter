@@ -26,6 +26,8 @@ from providers.registry import (
 )
 from satellite_processor import ImageFetcher
 from coordinate_loader import load_coordinates_file, CoordinateLoadError
+from core import events
+from core.errors import FailureKind
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help='批量模式下坐标并发数（默认: 1）')
     parser.add_argument('--no-dedup', action='store_true',
                         help='关闭重复检测，每个历史日期都单独输出')
+    parser.add_argument('--events', action='store_true',
+                        help='输出 TG_EVENT 结构化事件（供 GUI/自动化消费）')
 
     return parser
 
@@ -85,6 +89,42 @@ def _resolve_output_dir(args) -> str:
     if args.source == 'wayback':
         return 'data/output/historical'
     return f'data/output/{args.source}'
+
+
+def _failure_counts(results):
+    """统计失败结果中的 failure_kind 计数。"""
+    counts = {}
+    for r in results:
+        if r.get('status') != 'failed':
+            continue
+        kind = r.get('failure_kind')
+        key = kind.value if isinstance(kind, FailureKind) else 'internal'
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _compute_exit_code(results):
+    """按结果列表计算 CLI 退出码。
+
+    Args:
+        results: fetch_all / fetch_batch 展平后的结果列表。
+    Returns:
+        4: 结果为空，或全部失败（非接口变更）；
+        0: 没有失败结果；
+        5: 全部失败且全部为 INTERFACE_CHANGED；
+        3: 部分失败。
+    """
+    if not results:
+        return 4
+    failed = [r for r in results if r.get('status') == 'failed']
+    if not failed:
+        return 0
+    if len(failed) == len(results):
+        if all(r.get('failure_kind') == FailureKind.INTERFACE_CHANGED
+               for r in failed):
+            return 5
+        return 4
+    return 3
 
 
 def main():
@@ -185,6 +225,7 @@ def main():
             buffer_size=args.buffer,
             date_range=date_range,
             coord_concurrency=args.coord_concurrency,
+            emit_events=args.events,
         )
 
         # 打印批量摘要
@@ -192,7 +233,6 @@ def main():
         print(f"数据源: {info.display_name} (source={info.name})")
         total_success = 0
         total_failed = 0
-        all_zero = True
         for s in summary:
             status = "[OK]" if s['failed'] == 0 and s['success'] > 0 else (
                 "[FAIL]" if s['success'] == 0 else "[PART]")
@@ -200,17 +240,23 @@ def main():
                   f"成功 {s['success']}/{s['total_dates']}")
             total_success += s['success']
             total_failed += s['failed']
-            if s['success'] > 0:
-                all_zero = False
 
         print("\n" + "=" * 60)
         print(f"完成！共 {len(summary)} 个坐标点；日期版本成功 {total_success}, "
               f"失败 {total_failed}")
         print("=" * 60)
-        # 退出码：所有坐标全部失败 → 1；否则 0
-        if summary and all_zero:
-            sys.exit(1)
-        sys.exit(0)
+        flat_results = []
+        for s in summary:
+            flat_results.extend(s['results'])
+        if args.events:
+            events.emit({
+                'type': 'run_summary',
+                'mode': 'batch',
+                'success': total_success,
+                'failed': total_failed,
+                'failure_counts': _failure_counts(flat_results),
+            })
+        sys.exit(_compute_exit_code(flat_results))
     else:
         # 单点模式
         results = fetcher.fetch_all(
@@ -220,6 +266,7 @@ def main():
             output_dir=output_dir,
             buffer_size=args.buffer,
             date_range=date_range,
+            emit_events=args.events,
         )
 
         if results:
@@ -233,8 +280,16 @@ def main():
         print("=" * 60)
 
         success = sum(1 for r in results if r['status'] == 'success')
-        if results and success == 0:
-            sys.exit(1)
+        failed = sum(1 for r in results if r['status'] == 'failed')
+        if args.events:
+            events.emit({
+                'type': 'run_summary',
+                'mode': 'single',
+                'success': success,
+                'failed': failed,
+                'failure_counts': _failure_counts(results),
+            })
+        sys.exit(_compute_exit_code(results))
 
 
 if __name__ == "__main__":

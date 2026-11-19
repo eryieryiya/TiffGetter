@@ -25,7 +25,8 @@ def test_fetch_batch_runs_coordinates_in_parallel(fetcher_factory, monkeypatch, 
     lock = threading.Lock()
 
     def _fake_fetch_all(self, lat, lon, zoom=18, output_dir=None,
-                        buffer_size=500, date_range=None, dedup=None):
+                        buffer_size=500, date_range=None, dedup=None,
+                        emit_events=False, event_coord=None):
         with lock:
             records.append((threading.current_thread().ident, id(self)))
         barrier.wait()
@@ -53,7 +54,8 @@ def test_fetch_batch_preserves_input_order(fetcher_factory, monkeypatch, tmp_pat
     fetcher = fetcher_factory()
 
     def _fake_fetch_all(self, lat, lon, zoom=18, output_dir=None,
-                        buffer_size=500, date_range=None, dedup=None):
+                        buffer_size=500, date_range=None, dedup=None,
+                        emit_events=False, event_coord=None):
         if lat == 31.2304:
             time.sleep(0.05)
         return _success_result()
@@ -79,7 +81,8 @@ def test_fetch_batch_value_error_is_isolated(fetcher_factory, monkeypatch, tmp_p
     fetcher = fetcher_factory()
 
     def _fake_fetch_all(self, lat, lon, zoom=18, output_dir=None,
-                        buffer_size=500, date_range=None, dedup=None):
+                        buffer_size=500, date_range=None, dedup=None,
+                        emit_events=False, event_coord=None):
         if lat == 999:
             raise ValueError("lat 越界")
         return _success_result()

@@ -1,9 +1,11 @@
 """数据源抽象：统一描述数据源能力与瓦片获取接口。"""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import requests
+
+from core.errors import TileResult
 
 
 @dataclass(frozen=True)
@@ -57,5 +59,5 @@ class TileSource(ABC):
         """返回该坐标可用的 release 列表（按日期升序）。"""
 
     @abstractmethod
-    def fetch_tile(self, z: int, x: int, y: int, release: Dict) -> Optional[bytes]:
-        """下载单张瓦片；失败返回 None。"""
+    def fetch_tile(self, z: int, x: int, y: int, release: Dict) -> TileResult:
+        """下载单张瓦片；失败返回带失败类型的 TileResult。"""
