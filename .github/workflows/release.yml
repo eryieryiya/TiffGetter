@@ -51,7 +51,23 @@ jobs:
         run: conda run --no-capture-output -n satellite-image-processing python -m ruff check .
 
       - name: Build executable
-        run: .\build_exe.ps1 -Python "${{ steps.envpy.outputs.path }}" -SkipVerify
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'build.log'
+          $code = 0
+          $LASTEXITCODE = 0
+          try {
+            .\build_exe.ps1 -Python "${{ steps.envpy.outputs.path }}" -SkipVerify *> $log
+            $code = $LASTEXITCODE
+          } catch {
+            $_ | Out-String | Add-Content $log
+            $code = 1
+          }
+          Get-Content $log -Tail 40
+          if ($code -ne 0) {
+            $tail = (Get-Content $log -Tail 40 | Out-String)
+            Add-Content $env:GITHUB_STEP_SUMMARY "### Build executable failed (exit $code)`n``````n$tail`n``````"
+            exit $code
+          }
 
       - name: Verify CLI entry
         run: .\dist\TiffGetter.exe --help

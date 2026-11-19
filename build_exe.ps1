@@ -111,9 +111,18 @@ if (Test-Path $iconSrc) {
     Write-Host '[!] 未找到 icon\main_v2.png，将使用默认图标' -ForegroundColor Yellow
 }
 
-$pyVer = & $py -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-$riVer = & $py -c "import rasterio; print(rasterio.__version__)"
-Write-Host "[*] Python $pyVer + rasterio $riVer + PyInstaller $(& $py -m PyInstaller --version)"
+# 原生命令可能向 stderr 输出 warning（CI 环境下更常见），
+# 在 Stop 模式下会被当作终止错误，这里统一放宽并只按退出码判断。
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $pyVer = & $py -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+    $riVer = & $py -c "import rasterio; print(rasterio.__version__)"
+    $piVer = & $py -m PyInstaller --version
+} finally {
+    $ErrorActionPreference = $oldEap
+}
+Write-Host "[*] Python $pyVer + rasterio $riVer + PyInstaller $piVer"
 
 # ---- 3. 打包 ----
 Write-Host ''
@@ -126,8 +135,15 @@ if (Test-Path $staleIco) {
     Write-Host '[*] 已清理旧 icon\main_v2.ico，spec 将重新生成' -ForegroundColor DarkGray
 }
 
-& $py -m PyInstaller --noconfirm --clean --log-level WARN TiffGetter.spec
-if ($LASTEXITCODE -ne 0) { throw 'PyInstaller 打包失败' }
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $py -m PyInstaller --noconfirm --clean --log-level WARN TiffGetter.spec
+    $buildCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $oldEap
+}
+if ($buildCode -ne 0) { throw 'PyInstaller 打包失败' }
 
 $exe = Join-Path $Root 'dist\TiffGetter.exe'
 if (-not (Test-Path $exe)) { throw "打包完成但未找到产物: $exe" }
