@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "镜像 tag（代码取自运行工作流时选择的分支，例如 v0.1.0）"
+        description: "镜像 tag（代码取自运行工作流时选择的分支，例如 v0.1.4）"
         required: true
-        default: "v0.1.0"
+        default: "v0.1.4"
 
 permissions:
   contents: read

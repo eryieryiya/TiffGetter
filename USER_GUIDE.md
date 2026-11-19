@@ -67,7 +67,7 @@ data/output/<source>/current/current.png
 ```
 
 例如 `data/output/historical/2024-08-15/2024-08-15.tif`，或 `data/output/esri/current/current.tif`。
-每个 release 目录还会写入 `metadata.json`（数据源、版权、范围与参数）。
+每个 release 目录还会写入 `metadata.json`（数据源、版权、范围、参数、诊断与元数据来源）。
 
 ---
 
@@ -349,9 +349,9 @@ Tiananmen,39.9042,116.4074
 | 列 | 说明 |
 |----|------|
 | 日期 / 名称 | 单点模式：日期；批量模式：坐标名称 |
-| 状态 | ✅ success / ⚠️ partial / ❌ failed / 🔁 duplicate |
+| 状态 | ✅ success / 📁 existing / ♻️ duplicate / ❌ failed（旧日志回退下可能出现 ⚠️ partial） |
 | 失败原因 | 失败分类的中文映射（如「请求过多 (429)」「外部接口已变更」）；成功或重复时为空 |
-| 路径 | 文件完整路径（批量模式下显示 `lat,lon 成功 X/Y`） |
+| 路径 | 文件完整路径；失败事件无路径时为空，旧日志回退下批量显示 `lat,lon 成功 X/Y` |
 
 **双击行**：在文件资源管理器中打开路径所在目录。
 
@@ -502,13 +502,15 @@ TiffGetter.exe --help
 镜像只包含命令行模式，不含 GUI：
 
 ```bash
-docker pull ghcr.io/eryieryiya/tiffgetter:latest
+docker pull ghcr.io/eryieryiya/tiffgetter:v0.1.4
 
 docker run --rm \
   -v "$PWD/out:/app/data/output" \
-  ghcr.io/eryieryiya/tiffgetter:latest \
+  ghcr.io/eryieryiya/tiffgetter:v0.1.4 \
   --source esri --lat 35.6586 --lon 139.7454
 ```
+
+`:latest` 也会随最新 tag 更新；生产环境建议固定版本号，当前最新为 `v0.1.4`。
 
 输出位于挂载目录下的 `<source>/current/` 或历史日期目录。Linux 下如遇写权限问题，加 `-u "$(id -u):$(id -g)"`；完整说明见 README 的「Docker（仅 CLI）」一节。
 
@@ -564,10 +566,13 @@ data/output/batch/                  # wayback 默认；其它源为 data/output/
 | `release_id` / `release_date` | 版本 ID 与日期；非历史源均为 `current` |
 | `attribution` | 版权归属文本 |
 | `lat` / `lon` | 采集坐标 |
-| `zoom` / `buffer` | 缩放级别与缓冲区（米） |
+| `zoom` / `buffer` | 缩放级别与缓冲区半径（米） |
 | `bounds` | 输出影像的 WGS84 边界（min_lon/min_lat/max_lon/max_lat） |
 | `created_at` | 采集时间（ISO 8601，含时区） |
 | `files` | `png` / `tif` 文件名（GeoTIFF 失败时 `tif` 为 `null`） |
+| `metadata_source` | 元数据来源：`online` / `cache` / `fallback` / `native` |
+| `metadata_fetched_at` | 元数据获取时间（ISO 8601）；`native` 时为空 |
+| `diagnostics` | `by_kind`（失败类型计数）、`failed_tiles`（失败瓦片数）、`samples`（前 3 条失败样本） |
 
 ### 去重规则
 
@@ -575,7 +580,7 @@ data/output/batch/                  # wayback 默认；其它源为 data/output/
 - 缺少 `metadata.json` 的旧输出按 `wayback` 处理。
 - 同一视觉组保留最早日期：按日期升序处理，后续相同影像标记为 `duplicate`。
 - 指定日期范围时，去重只与区间内的已有输出比较，避免区间外影像让区间内最早日期被跳过；结束时打印 `[区间校验] 区间内最早保留影像日期: ...`。
-- 结果状态：`success` / `existing` / `duplicate` / `failed` / `unsupported`。
+- 结果状态：`success` / `existing` / `duplicate` / `failed`。
 - 加 `--no-dedup` 关闭上述检测，每个历史日期都会单独下载并输出。
 
 ### GeoTIFF 文件

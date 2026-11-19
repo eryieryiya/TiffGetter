@@ -1,5 +1,7 @@
 # UI 现代化与用户友好改进设计
 
+> 状态：历史设计文档（2026-08-20）。当前实现已演进到 `v0.1.4`，子进程新增 `TG_EVENT` 事件协议，日志正则保留为回退；用户可见行为以 README 与 USER_GUIDE 为准。
+
 - 日期：2026-08-20
 - 范围：方案 A（分层渐进改造），不改动业务逻辑与子进程协议
 - 默认主题：Tokyo Night（暗/亮配对），支持持久化切换
@@ -10,7 +12,7 @@
 下列契约保留，不破坏现有调用方代码：
 
 - 子进程启动方式：`python main.py <args>` 通过 `subprocess.Popen(stdout=PIPE, stderr=STDOUT)` 读取行流
-- 日志行解析正则：`[i/N]` 进度、`[OK]`/`[FAIL]`/`[PART]` 结果行语义
+- 日志行解析正则：`[i/N]` 进度、`[OK]`/`[FAIL]`/`[PART]` 结果行语义（`v0.1.4` 起 GUI 优先消费 `TG_EVENT`，该正则保留为回退）
 - `_validate_inputs_single` / `_validate_inputs_batch` 的输入值域（zoom∈[1,20]、buffer∈[50,5000]、坐标范围、日期格式 `YYYY-MM-DD`）
 - `cleanup`、`coordinate_loader`、`satellite_processor` 三模块的公共 API
 

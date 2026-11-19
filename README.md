@@ -12,8 +12,10 @@
 - 支持日期范围筛选（仅支持历史版本的数据源）
 - 可调节缩放级别（1-20）和缓冲区半径
 - 多线程并发下载，自动 MD5 + dHash 去重（按数据源隔离），可用 `--no-dedup` 关闭
-- 输出 GeoTIFF（带地理参考）和 PNG 预览
-- 每个输出目录写入 `metadata.json`（数据源、版本、版权、范围、参数）
+- 输出 GeoTIFF（带地理参考）和 PNG 预览；rasterio 缺失时自动仅输出 PNG
+- 每个输出目录写入 `metadata.json`（数据源、版本、版权、范围、参数、诊断与元数据来源）
+- 失败分类与操作建议：CLI 输出分类提示与批量失败坐标，GUI 提供运行结束横幅与失败详情
+- 每个 release 完成后立即输出日志；启用 `--events` 时同步输出 `date_result` 事件
 - 提供命令行和图形界面两种使用方式
 - GUI 三 Tab：单点下载（含地图选点）/ 批量下载 / 清理与维护
 - 启动时自动清理 `temp_tiles_*` 临时瓦片残余
@@ -197,8 +199,9 @@ python ui_main.py
 - **三 Tab 布局** — 单点 / 批量 / 清理 Tab 互不干扰
 - **地图选点** — 嵌入式 OpenStreetMap 地图（Toplevel 弹窗），左键选点回写
 - **进度条** — 日志中的 `[i/N]` 自动驱动 determinate 进度条
-- **结果表** — Treeview 显示 success/existing/duplicate/failed；双击打开所在目录
-- **深色日志面板** — 实时显示下载进度和调试信息
+- **结果表** — Treeview 显示 success/existing/duplicate/failed，并显示失败原因；双击打开所在目录
+- **运行结束横幅** — 按退出码显示成功、部分失败、全部失败或接口变更，并提供失败详情窗口
+- **深色日志面板** — 实时显示下载进度、失败提示与错误分类
 - **状态栏** — 显示当前任务状态（就绪 / 运行中 / 正在停止 / 完成 / 已停止 / 清理中）
 - **停止按钮** — 支持随时终止正在进行的下载（CTRL_BREAK_EVENT）
 - **清理 Tab** — 勾选式二次确认删除，避免误删
@@ -286,7 +289,7 @@ data/output/esri/                     # 非历史源
 
 - `*.png` — 卫星影像预览图
 - `*.tif` — 带地理参考的 GeoTIFF（CRS: EPSG:4326 WGS84）
-- `metadata.json` — 数据源、版本、版权、坐标、缩放、缓冲区、边界、采集时间与文件列表
+- `metadata.json` — 数据源、版本、版权、坐标、缩放、缓冲区、边界、采集时间、文件列表、诊断与元数据来源
 
 ### metadata.json
 
@@ -302,7 +305,14 @@ data/output/esri/                     # 非历史源
   "buffer": 500,
   "bounds": {"min_lon": 139.74, "min_lat": 35.65, "max_lon": 139.75, "max_lat": 35.66},
   "created_at": "2026-11-18T12:00:00+08:00",
-  "files": {"png": "current.png", "tif": "current.tif"}
+  "files": {"png": "current.png", "tif": "current.tif"},
+  "metadata_source": "native",
+  "metadata_fetched_at": "",
+  "diagnostics": {
+    "by_kind": {},
+    "failed_tiles": 0,
+    "samples": []
+  }
 }
 ```
 
@@ -399,8 +409,9 @@ data/output/esri/                     # 非历史源
 ## 系统要求
 
 - Python 3.10+
-- [GDAL](https://gdal.org/)（用于 GeoTIFF 输出）
-- 依赖：`requests`, `pillow`, `numpy`, `rasterio`, `psutil`, `pyshp`, `pyproj`, `ttkbootstrap`, `tkintermapview`
+- [GDAL](https://gdal.org/)（可选，用于 GeoTIFF 输出；缺失时仅输出 PNG）
+- 依赖：`requests`, `pillow`, `numpy`, `psutil`, `pyshp`, `pyproj`, `ttkbootstrap`, `tkintermapview`
+- `rasterio`（可选，用于 GeoTIFF；未安装时 CLI 会在启动预检中提示）
 
 ## 安装
 
@@ -448,7 +459,7 @@ python -m ruff check .
 ### 产物
 
 ```
-dist/TiffGetter.exe    # 约 83 MB，onefile 单文件
+dist/TiffGetter.exe    # 约 80 MB，onefile 单文件（随依赖版本略有浮动）
 ```
 
 ### 使用方式
