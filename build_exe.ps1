@@ -34,8 +34,15 @@ function Find-BuildPython {
     # 优先当前激活的 python（若带 PyInstaller）
     $cur = (Get-Command python -ErrorAction SilentlyContinue).Source
     if ($cur) {
-        & $cur -m PyInstaller --version *>$null
-        if ($LASTEXITCODE -eq 0) { return $cur }
+        $oldEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $cur -m PyInstaller --version *>$null
+            $hasPyInstaller = $LASTEXITCODE -eq 0
+        } finally {
+            $ErrorActionPreference = $oldEap
+        }
+        if ($hasPyInstaller) { return $cur }
     }
     # 其次 conda base（本机验证可用的构建环境）
     if (Test-Path $CondaBase) { return $CondaBase }
@@ -44,8 +51,16 @@ function Find-BuildPython {
 }
 
 function Test-Module([string]$py, [string]$module) {
-    & $py -c "import $module" 2>$null
-    return $LASTEXITCODE -eq 0
+    # 原生命令的 stderr 在 $ErrorActionPreference='Stop' 下会变成终止错误，
+    # 这里临时放宽，仅通过退出码判断模块是否存在。
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $py -c "import $module" 2>$null | Out-Null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $oldEap
+    }
 }
 
 function Install-IfMissing([string]$py, [string]$module) {
@@ -54,13 +69,20 @@ function Install-IfMissing([string]$py, [string]$module) {
         throw "缺少依赖: $module（已指定 -NoInstallDeps，跳过安装）"
     }
     Write-Host "[*] 安装缺失依赖: $module ..." -ForegroundColor Cyan
-    & $py -m pip install $module
-    if ($LASTEXITCODE -ne 0) { throw "安装 $module 失败" }
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $py -m pip install $module
+        $pipCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldEap
+    }
+    if ($pipCode -ne 0) { throw "安装 $module 失败" }
 }
 
-Write-Host '=' * 62 -ForegroundColor DarkCyan
+Write-Host ('=' * 62) -ForegroundColor DarkCyan
 Write-Host ' TiffGetter 打包脚本 (PyInstaller onefile)' -ForegroundColor DarkCyan
-Write-Host '=' * 62 -ForegroundColor DarkCyan
+Write-Host ('=' * 62) -ForegroundColor DarkCyan
 
 # ---- 1. 环境探测 ----
 $py = Find-BuildPython
@@ -120,8 +142,15 @@ if ($SkipVerify) {
 
 Write-Host ''
 Write-Host '[*] 验证 1/3: CLI 模式（--help）...' -ForegroundColor Cyan
-& $exe --help *> $null
-if ($LASTEXITCODE -ne 0) {
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $exe --help *> $null
+    $helpCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $oldEap
+}
+if ($helpCode -ne 0) {
     throw 'CLI 验证失败：exe --help 非零退出（运行时依赖缺失？）'
 }
 Write-Host '     PASS: CLI --help 正常' -ForegroundColor Green
@@ -152,7 +181,13 @@ Remove-Item $stderrFile -ErrorAction SilentlyContinue
 Write-Host '     PASS: GUI 窗口正常启动（15s 内无异常退出，已自动关闭）' -ForegroundColor Green
 
 Write-Host '[*] 验证 3/3: 归档关键数据检查...' -ForegroundColor Cyan
-$listing = & $py -m PyInstaller.utils.cliutils.archive_viewer -l $exe 2>$null
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $listing = & $py -m PyInstaller.utils.cliutils.archive_viewer -l $exe 2>$null
+} finally {
+    $ErrorActionPreference = $oldEap
+}
 foreach ($needle in @('gdalvrt.xsd', 'proj.db')) {
     $found = $listing -match [regex]::Escape($needle)
     if ($found) {
@@ -163,11 +198,11 @@ foreach ($needle in @('gdalvrt.xsd', 'proj.db')) {
 }
 
 Write-Host ''
-Write-Host '=' * 62 -ForegroundColor DarkCyan
+Write-Host ('=' * 62) -ForegroundColor DarkCyan
 Write-Host " 打包完成: $exe ($sizeMb MB)" -ForegroundColor Green
 Write-Host ' 使用: 双击运行 GUI；命令行模式见 --help' -ForegroundColor DarkCyan
 $iconOut = Join-Path $Root 'icon\main_v2.ico'
 if (Test-Path $iconOut) {
     Write-Host " 应用图标: $iconOut（已嵌入 exe）" -ForegroundColor DarkCyan
 }
-Write-Host '=' * 62 -ForegroundColor DarkCyan
+Write-Host ('=' * 62) -ForegroundColor DarkCyan
