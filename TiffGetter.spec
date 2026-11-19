@@ -8,6 +8,14 @@
 import os
 import sys
 
+# CI 的 Windows 控制台可能是 cp1252，spec 内中文 print 会抛 UnicodeEncodeError。
+# 统一把标准输出/错误切换为 UTF-8，避免打包在非中文代码页环境下中断。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 project_root = os.path.abspath(SPECPATH)  # spec 所在目录 = 项目根目录
