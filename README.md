@@ -412,6 +412,7 @@ data/output/esri/                     # 非历史源
 - [GDAL](https://gdal.org/)（可选，用于 GeoTIFF 输出；缺失时仅输出 PNG）
 - 依赖：`requests`, `pillow`, `numpy`, `psutil`, `pyshp`, `pyproj`, `ttkbootstrap`, `tkintermapview`
 - `rasterio`（可选，用于 GeoTIFF；未安装时 CLI 会在启动预检中提示）
+- 程序启动时会优先使用 rasterio 自带的 PROJ/GDAL 数据；若系统设置了 `PROJ_LIB`/`GDAL_DATA`，会自动切换到 rasterio 副本，避免 PostgreSQL/PostGIS 的 `proj.db` 版本冲突
 
 ## 安装
 

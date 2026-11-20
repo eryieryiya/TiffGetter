@@ -7,6 +7,7 @@ import math
 import shutil
 import logging
 import re
+import importlib.util
 import urllib3
 from datetime import datetime
 from PIL import Image
@@ -26,6 +27,24 @@ warnings.filterwarnings('ignore')
 
 # 仓库根目录（satellite_processor.py 所在目录）：用于启动时扫描残留临时瓦片
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _configure_rasterio_data_paths():
+    """将 PROJ/GDAL 数据目录指向 rasterio 自带副本，避免系统 PostgreSQL PROJ 库版本冲突。"""
+    spec = importlib.util.find_spec("rasterio")
+    if spec is None or not spec.submodule_search_locations:
+        return
+    package_dir = os.fspath(next(iter(spec.submodule_search_locations)))
+    proj_dir = os.path.join(package_dir, "proj_data")
+    gdal_dir = os.path.join(package_dir, "gdal_data")
+    if os.path.isdir(proj_dir):
+        os.environ["PROJ_LIB"] = proj_dir
+        os.environ["PROJ_DATA"] = proj_dir
+    if os.path.isdir(gdal_dir):
+        os.environ["GDAL_DATA"] = gdal_dir
+
+
+_configure_rasterio_data_paths()
 
 # rasterio 是 GeoTIFF 输出所必需，但部分 Conda 环境可能缺失 expat；
 # 采用延迟导入：仅在调用 png_to_geotiff 时尝试 import，
